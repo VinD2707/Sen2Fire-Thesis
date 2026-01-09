@@ -358,18 +358,18 @@ def infer_with_internals(model_key: str, x13: np.ndarray):
 
     # threshold slider (debug)
     t_default = float(T_BEST[model_key])
-    t_used = st.slider(
-        "Threshold (t_best) — debug override",
-        min_value=0.00, max_value=1.00,
-        value=t_default,
-        step=0.01
-    )
+    # t_used = st.slider(
+    #     "Threshold (t_best) — debug override",
+    #     min_value=0.00, max_value=1.00,
+    #     value=t_default,
+    #     step=0.01
+    # )
 
     t0 = time.perf_counter()
     with torch.no_grad():
         logits = model(x_norm)                 # (1,1,H,W)
         probs  = torch.sigmoid(logits)         # (1,1,H,W)
-        mask   = (probs >= t_used).float()     # (1,1,H,W)
+        mask   = (probs >= t_default).float()     # (1,1,H,W)
     t1 = time.perf_counter()
 
     logits_np = logits[0, 0].detach().cpu().numpy()
@@ -392,7 +392,7 @@ def infer_with_internals(model_key: str, x13: np.ndarray):
 
     internals = {
         "device": str(device),
-        "t_used": float(t_used),
+        "t_used": float(t_default),
         "infer_s": float(t1 - t0),
         "apply_scale_clip": bool(apply_scale_clip),
         "scale_div": scale_div,
@@ -589,21 +589,21 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
 
     visuals, internals, probs_np, mask_np = infer_with_internals(model_key, x13)
 
-    st.markdown("### Debug: distribution")
-    st.json({
-        "model_display": DISPLAY_NAME.get(model_key, model_key),
-        "t_used": internals["t_used"],
-        "apply_scale_clip": internals["apply_scale_clip"],
-        "scale_div": internals["scale_div"],
-        "clip": internals["clip"],
-        "probs_min": float(probs_np.min()),
-        "probs_max": float(probs_np.max()),
-        "probs_mean": float(probs_np.mean()),
-        "mask_sum_pixels": int(mask_np.sum()),
-        "mask_ratio": float(mask_np.mean()),
-        "gt_sum_pixels": None if gt01 is None else int(gt01.sum()),
-        "gt_ratio": None if gt01 is None else float(gt01.mean()),
-    })
+    # st.markdown("### Debug: distribution")
+    # st.json({
+    #     "model_display": DISPLAY_NAME.get(model_key, model_key),
+    #     "t_used": internals["t_used"],
+    #     "apply_scale_clip": internals["apply_scale_clip"],
+    #     "scale_div": internals["scale_div"],
+    #     "clip": internals["clip"],
+    #     "probs_min": float(probs_np.min()),
+    #     "probs_max": float(probs_np.max()),
+    #     "probs_mean": float(probs_np.mean()),
+    #     "mask_sum_pixels": int(mask_np.sum()),
+    #     "mask_ratio": float(mask_np.mean()),
+    #     "gt_sum_pixels": None if gt01 is None else int(gt01.sum()),
+    #     "gt_ratio": None if gt01 is None else float(gt01.mean()),
+    # })
 
     # ========================================================
     # MODEL INFO
@@ -619,6 +619,12 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
 
 **Patch Size:**  
 {H} × {W}{" ✅" if size_ok else " ⚠️"}
+
+**Input:**  
+Concatenation → **(13, H, W)** (12-band + aerosol)
+
+**Output:**  
+Logits → sigmoid → threshold → binary mask
 """)
 
     # ========================================================
@@ -706,7 +712,7 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
     # METRICS SUMMARY
     # ========================================================
     st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("## Metrics Summary")
+    st.markdown("## Model Quick Summary")
 
     dfm = load_metrics_df(model_key)
     if dfm.empty:
@@ -723,7 +729,7 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
             cB.metric("Best overall epoch", str(int(best_overall.get("epoch", -1))))
             cC.metric("Best overall va_f1", f"{float(best_overall.get('va_f1', 0.0)):.4f}")
             if auc_col:
-                cD.metric("Best overall va_pr_auc", f"{float(best_overall.get(auc_col, 0.0)):.4f}")
+                cD.metric("Below are the evaluation results of the model retrained with an adjusted threshold.")
             else:
                 cD.metric("va_pr_auc", "N/A")
 
