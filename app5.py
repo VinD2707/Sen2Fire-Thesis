@@ -1,7 +1,7 @@
 # app7.py
 # Sen2Fire — Pixel-wise Segmentation (Tabs)
-# Tab 1: Single Model Inference (Pipeline Internals + Metrics Summary + Test Metrics hard-coded)
-# Tab 2: Model Comparison (visual only)
+# Tab 1: Single Model Inference (clean + Train/Val/Test table only)
+# Tab 2: Model Comparison (visual only) -> 5 images (RGB + GT + 3 model overlays)
 #
 # Pipeline: logits -> sigmoid -> threshold (validation-derived) -> visualization/product
 # Patch-level logic removed.
@@ -11,6 +11,7 @@ import time
 import inspect
 import json
 from pathlib import Path
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -92,7 +93,6 @@ def load_norm_stats(path: Path):
     mean_13 = d["mean_13"]
     std_13  = d["std_13"]
 
-    # optional (default OFF to match notebook-style)
     apply_scale_clip = bool(d.get("apply_scale_clip", False))
     scale_div = d.get("scale_div", None)
     clip = d.get("clip", None)
@@ -101,11 +101,10 @@ def load_norm_stats(path: Path):
 
 
 # ============================================================
-# PATHS + MODELS
+# PATHS + MODELS (non-pretrained removed)
 # ============================================================
 APP_DIR = Path(__file__).resolve().parent
 
-# NOTE: "DeepLabV3+ (EfficientNet-B4) — non-pretrained" REMOVED as requested.
 WEIGHTS = {
     "U-Net (JP retrained)": APP_DIR / "thesis_unet" / "unet_best_retrained2.pth",
     "U-Net Eff (EfficientNet-B4)": APP_DIR / "unet_eff" / "efficientb4_pretrained.pth",
@@ -125,26 +124,16 @@ METRICS = {
     ],
 }
 
-# Thresholds (as shown in your desired labels on image 2 -> all 0.05)
 T_BEST = {
     "U-Net (JP retrained)": 0.15,
     "U-Net Eff (EfficientNet-B4)": 0.05,
     "DeepLabV3+ (EfficientNet-B4) — pretrained": 0.05,
 }
 
-# IMPORTANT:
-# norm_stats.json harus berasal dari training pipeline yang sama.
-# Default-nya: hanya mean/std, tanpa scale_div/clip.
 PREPROCESS = {
-    "U-Net (JP retrained)": {
-        "norm_path": APP_DIR / "thesis_unet" / "norm_stats.json",
-    },
-    "U-Net Eff (EfficientNet-B4)": {
-        "norm_path": APP_DIR / "unet_eff" / "norm_stats.json",
-    },
-    "DeepLabV3+ (EfficientNet-B4) — pretrained": {
-        "norm_path": APP_DIR / "thesis_deeplab" / "norm_stats.json",
-    },
+    "U-Net (JP retrained)": {"norm_path": APP_DIR / "thesis_unet" / "norm_stats.json"},
+    "U-Net Eff (EfficientNet-B4)": {"norm_path": APP_DIR / "unet_eff" / "norm_stats.json"},
+    "DeepLabV3+ (EfficientNet-B4) — pretrained": {"norm_path": APP_DIR / "thesis_deeplab" / "norm_stats.json"},
 }
 
 ARCH = {
@@ -182,7 +171,6 @@ TEST_METRICS = {
 
 RGB_IDXS = (0, 1, 2)
 
-# DISPLAY NAMES (match your image-2 naming)
 DISPLAY_NAME = {
     "U-Net (JP retrained)": "U-Net + Resnet18 (thr: 0.15)",
     "U-Net Eff (EfficientNet-B4)": "U-Net + EfficientNet-b4 (thr: 0.05)",
@@ -291,18 +279,19 @@ def overlay_binary(rgb01: np.ndarray, mask01: np.ndarray, alpha=0.4) -> np.ndarr
     return np.clip((1 - alpha * m) * rgb + (alpha * m) * red, 0, 1)
 
 
-def overlay_prob_red(rgb01: np.ndarray, prob01: np.ndarray, alpha=0.4) -> np.ndarray:
+def overlay_probabilities(rgb01: np.ndarray, probs01: np.ndarray, alpha=0.55) -> np.ndarray:
     """
-    Notebook-style:
-      imshow(img_vis)
-      imshow(prob, cmap='Reds', alpha=0.4)
+    Raw sigmoid overlay:
+    intensity of red is proportional to probability (0..1).
+    """
+    rgb = rgb01.copy().astype(np.float32)
+    p = np.clip(probs01.astype(np.float32), 0.0, 1.0)[..., None]  # (H,W,1)
 
-    Approx with RGB blending, intensity follows prob.
-    """
-    p = np.clip(prob01.astype(np.float32), 0, 1)[..., None]
-    red = np.zeros_like(rgb01)
+    red = np.zeros_like(rgb)
     red[..., 0] = 1.0
-    return np.clip((1 - alpha * p) * rgb01 + (alpha * p) * red, 0, 1)
+
+    # stronger probs -> more red
+    return np.clip((1 - alpha * p) * rgb + (alpha * p) * red, 0, 1)
 
 
 def red_mask_on_white(mask01: np.ndarray) -> np.ndarray:
@@ -313,43 +302,11 @@ def red_mask_on_white(mask01: np.ndarray) -> np.ndarray:
     return out
 
 
-def bw_binary_mask(mask01: np.ndarray) -> np.ndarray:
-    """
-    Black-white mask:
-      - 0 -> black
-      - 1 -> white
-    Returned as 3-channel float in [0,1] so st.image looks consistent.
-    """
-    m = (mask01 > 0.5).astype(np.float32)
-    return np.stack([m, m, m], axis=-1)
-
-
-def stats_np(arr: np.ndarray) -> dict:
-    return {
-        "shape": str(tuple(arr.shape)),
-        "min": float(np.min(arr)),
-        "max": float(np.max(arr)),
-        "mean": float(np.mean(arr)),
-        "std": float(np.std(arr)),
-    }
-
-
-def stats_torch(t: torch.Tensor) -> dict:
-    tt = t.detach().float().cpu()
-    return {
-        "shape": str(tuple(tt.shape)),
-        "min": float(tt.min().item()),
-        "max": float(tt.max().item()),
-        "mean": float(tt.mean().item()),
-        "std": float(tt.std().item()),
-    }
-
-
-def infer_with_internals(model_key: str, x13: np.ndarray):
+def infer_with_internals(model_key: str, x13: np.ndarray, t_used: float):
     """
     Returns:
-      visuals: rgb, pred_prob_overlay, pred_bin_overlay, pred_bin_bw
-      internals: dict of stats
+      visuals: rgb, pred_prob_overlay, pred_bin_overlay
+      internals: dict (kept internal)
       raw arrays: probs_np, mask_np
     """
     device = get_device()
@@ -358,10 +315,8 @@ def infer_with_internals(model_key: str, x13: np.ndarray):
     pp = PREPROCESS[model_key]
     mean_13, std_13, apply_scale_clip, scale_div, clip = load_norm_stats(pp["norm_path"])
 
-    # Match notebook-style first (default): only normalize_batch(mean/std)
     x13p = x13.astype(np.float32)
 
-    # Optional: ONLY if your norm_stats.json explicitly says so
     if apply_scale_clip:
         if scale_div is not None:
             x13p = x13p / float(scale_div)
@@ -372,64 +327,28 @@ def infer_with_internals(model_key: str, x13: np.ndarray):
     x_raw = torch.from_numpy(x13p).unsqueeze(0).to(device)   # (1,13,H,W)
     x_norm = normalize_batch(x_raw, mean_13, std_13)
 
-    # threshold slider (debug)
-    t_default = float(T_BEST[model_key])
-    # t_used = st.slider(
-    #     "Threshold (t_best) — debug override",
-    #     min_value=0.00, max_value=1.00,
-    #     value=t_default,
-    #     step=0.01
-    # )
-
     t0 = time.perf_counter()
     with torch.no_grad():
         logits = model(x_norm)                 # (1,1,H,W)
         probs  = torch.sigmoid(logits)         # (1,1,H,W)
-        mask   = (probs >= t_default).float()     # (1,1,H,W)
+        mask   = (probs >= float(t_used)).float()
     t1 = time.perf_counter()
 
-    logits_np = logits[0, 0].detach().cpu().numpy()
     probs_np  = probs[0, 0].detach().cpu().numpy()
     mask_np   = mask[0, 0].detach().cpu().numpy()
 
-    pred_fire_pixels = int(mask_np.sum())
-    total_pixels = int(mask_np.size)
-    pred_fire_ratio = float(pred_fire_pixels / max(total_pixels, 1))
-
-    # Display RGB from ORIGINAL x13 (not normalized)
     rgb = to_rgb_for_display(x13)
-
-    # Notebook-style visuals
-    pred_prob_overlay = overlay_prob_red(rgb, probs_np, alpha=0.4)
-    pred_bin_overlay  = overlay_binary(rgb, mask_np, alpha=0.4)
-
-    # NEW: B/W binary mask for your requested "gambar ke-3 jadi hitam putih"
-    pred_bin_bw = bw_binary_mask(mask_np)
-
-    internals = {
-        "device": str(device),
-        "t_used": float(t_default),
-        "infer_s": float(t1 - t0),
-        "apply_scale_clip": bool(apply_scale_clip),
-        "scale_div": scale_div,
-        "clip": clip,
-        "x13_raw_tensor": stats_torch(x_raw),
-        "x13_norm_tensor": stats_torch(x_norm),
-        "logits": stats_np(logits_np),
-        "probs": stats_np(probs_np),
-        "mask": {
-            "shape": str(mask_np.shape),
-            "fire_pixels": pred_fire_pixels,
-            "total_pixels": total_pixels,
-            "fire_ratio": pred_fire_ratio,
-        },
-    }
 
     visuals = {
         "rgb": rgb,
-        "pred_prob_overlay": pred_prob_overlay,
-        "pred_bin_overlay": pred_bin_overlay,
-        "pred_bin_bw": pred_bin_bw,
+        "pred_prob_overlay": overlay_probabilities(rgb, probs_np, alpha=0.55),   # <<< ini yang kamu mau (gambar 2)
+        "pred_bin_overlay": overlay_binary(rgb, mask_np, alpha=0.4),             # product
+    }
+
+    internals = {
+        "device": str(device),
+        "t_used": float(t_used),
+        "infer_s": float(t1 - t0),
     }
 
     return visuals, internals, probs_np, mask_np
@@ -455,26 +374,87 @@ def load_metrics_df(model_key: str) -> pd.DataFrame:
     return out
 
 
-def metrics_best_rows(df: pd.DataFrame):
-    if df.empty or "va_f1" not in df.columns:
-        return None, pd.DataFrame()
-
-    best_per_run = (
-        df.sort_values("va_f1", ascending=False)
-          .groupby("run", as_index=False)
-          .head(1)
-          .sort_values("run")
-    )
-
-    best_overall = df.loc[df["va_f1"].idxmax()]
-    return best_overall, best_per_run
-
-
-def pick_auc_column(df: pd.DataFrame) -> str | None:
-    for c in ["va_PRauc", "va_prauc", "va_pr_auc", "va_auc", "va_AUC"]:
+def pick_pr_auc_col(df: pd.DataFrame, prefix: str) -> Optional[str]:
+    candidates = [
+        f"{prefix}pr_auc",
+        f"{prefix}prAUC",
+        f"{prefix}prauc",
+        f"{prefix}PRauc",
+        f"{prefix}PR_AUC",
+        f"{prefix}auc",
+        f"{prefix}AUC",
+    ]
+    for c in candidates:
         if c in df.columns:
             return c
+    for c in df.columns:
+        if c.lower().startswith(prefix.lower()) and "pr" in c.lower() and "auc" in c.lower():
+            return c
     return None
+
+
+def best_overall_row(df: pd.DataFrame) -> Optional[pd.Series]:
+    if df.empty or "va_f1" not in df.columns:
+        return None
+    return df.loc[df["va_f1"].idxmax()]
+
+
+def get_metric_value(row: pd.Series, key_candidates: List[str]) -> Any:
+    for k in key_candidates:
+        if k in row.index:
+            return row[k]
+    return np.nan
+
+
+def build_train_val_test_table(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
+    row = best_overall_row(df)
+    tm = TEST_METRICS.get(model_key, {})
+
+    if row is None:
+        return pd.DataFrame([{
+            "split": "test_set",
+            "loss": tm.get("test_loss", np.nan),
+            "precision": tm.get("test_precision", np.nan),
+            "recall": tm.get("test_recall", np.nan),
+            "f1": tm.get("test_f1", np.nan),
+            "acc": tm.get("test_acc", np.nan),
+            "pr_auc": tm.get("test_pr_auc", np.nan),
+        }])
+
+    tr_pr_auc_col = pick_pr_auc_col(df, "tr_")
+    va_pr_auc_col = pick_pr_auc_col(df, "va_")
+
+    train = {
+        "split": "train_set",
+        "loss": get_metric_value(row, ["tr_loss", "train_loss"]),
+        "precision": get_metric_value(row, ["tr_precision", "train_precision"]),
+        "recall": get_metric_value(row, ["tr_recall", "train_recall"]),
+        "f1": get_metric_value(row, ["tr_f1", "train_f1"]),
+        "acc": get_metric_value(row, ["tr_acc", "train_acc", "tr_accuracy", "train_accuracy"]),
+        "pr_auc": row[tr_pr_auc_col] if (tr_pr_auc_col and tr_pr_auc_col in row.index) else np.nan,
+    }
+
+    val = {
+        "split": "val_set",
+        "loss": get_metric_value(row, ["va_loss", "val_loss"]),
+        "precision": get_metric_value(row, ["va_precision", "val_precision"]),
+        "recall": get_metric_value(row, ["va_recall", "val_recall"]),
+        "f1": get_metric_value(row, ["va_f1", "val_f1"]),
+        "acc": get_metric_value(row, ["va_acc", "val_acc", "va_accuracy", "val_accuracy"]),
+        "pr_auc": row[va_pr_auc_col] if (va_pr_auc_col and va_pr_auc_col in row.index) else np.nan,
+    }
+
+    test = {
+        "split": "test_set",
+        "loss": tm.get("test_loss", np.nan),
+        "precision": tm.get("test_precision", np.nan),
+        "recall": tm.get("test_recall", np.nan),
+        "f1": tm.get("test_f1", np.nan),
+        "acc": tm.get("test_acc", np.nan),
+        "pr_auc": tm.get("test_pr_auc", np.nan),
+    }
+
+    return pd.DataFrame([train, val, test])
 
 
 # ============================================================
@@ -526,9 +506,8 @@ for k, p in WEIGHTS.items():
     if not p.exists():
         missing.append(f"{k} weights missing: {p}")
 for k, d in PREPROCESS.items():
-    npth = d["norm_path"]
-    if not npth.exists():
-        missing.append(f"{k} norm_stats.json missing: {npth}")
+    if not d["norm_path"].exists():
+        missing.append(f"{k} norm_stats.json missing: {d['norm_path']}")
 
 if missing:
     st.error("Missing files:\n\n" + "\n".join(missing))
@@ -574,20 +553,6 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)  # upload-card
-
-    with st.expander("Input specification (what this app expects)"):
-        st.markdown(
-            """
-- File format: `.npz` (NumPy zipped arrays)
-- Required arrays:
-  - `image`: `(12, H, W)`
-  - `aerosol`: `(H, W)`
-- Optional arrays:
-  - `label`: `(H, W)` (Ground Truth mask; used only for visualization & patch metrics)
-- Model input: concatenation → `(13, H, W)`
-- Output: logits → sigmoid probabilities (0–1) → threshold `t_best` → binary mask
-            """.strip()
-        )
     st.markdown("</div>", unsafe_allow_html=True)  # center-wrap
 
     if uploaded is None:
@@ -603,27 +568,9 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
     H, W = x13.shape[1], x13.shape[2]
     size_ok = (H == 512 and W == 512)
 
-    visuals, internals, probs_np, mask_np = infer_with_internals(model_key, x13)
+    t_used = float(T_BEST[model_key])
+    visuals, internals, probs_np, mask_np = infer_with_internals(model_key, x13, t_used=t_used)
 
-    # st.markdown("### Debug: distribution")
-    # st.json({
-    #     "model_display": DISPLAY_NAME.get(model_key, model_key),
-    #     "t_used": internals["t_used"],
-    #     "apply_scale_clip": internals["apply_scale_clip"],
-    #     "scale_div": internals["scale_div"],
-    #     "clip": internals["clip"],
-    #     "probs_min": float(probs_np.min()),
-    #     "probs_max": float(probs_np.max()),
-    #     "probs_mean": float(probs_np.mean()),
-    #     "mask_sum_pixels": int(mask_np.sum()),
-    #     "mask_ratio": float(mask_np.mean()),
-    #     "gt_sum_pixels": None if gt01 is None else int(gt01.sum()),
-    #     "gt_ratio": None if gt01 is None else float(gt01.mean()),
-    # })
-
-    # ========================================================
-    # MODEL INFO
-    # ========================================================
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.markdown("## Model Info")
     st.markdown(f"""
@@ -631,21 +578,18 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
 {DISPLAY_NAME.get(model_key, model_key)}
 
 **Threshold used (t_used):**  
-{internals['t_used']}
+{t_used}
 
 **Patch Size:**  
 {H} × {W}{" ✅" if size_ok else " ⚠️"}
 
 **Input:**  
-Concatenation → **(13, H, W)** (12-band + aerosol)
+Model input: concatenation → **(13, H, W)** (12-band image + 1 aerosol)
 
 **Output:**  
-Logits → sigmoid → threshold → binary mask
+Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary mask
 """)
 
-    # ========================================================
-    # QUICK SUMMARY / PATCH METRICS
-    # ========================================================
     st.markdown("<hr/>", unsafe_allow_html=True)
     if gt01 is not None:
         st.markdown("## Selected Patch Prediction Overview")
@@ -665,47 +609,10 @@ Logits → sigmoid → threshold → binary mask
     else:
         st.info("No Ground Truth `label` found → patch metrics not computed.")
 
-    # ========================================================
-    # PIPELINE INTERNALS
-    # ========================================================
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("## Pipeline Internals (Numbers)")
-    left, right = st.columns([1.05, 1.0], gap="large")
-
-    with left:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### A) Input Tensors")
-        st.markdown('<div class="small">Raw tensor & normalized tensor fed to the model.</div>', unsafe_allow_html=True)
-        st.markdown("**x13_raw_tensor**")
-        st.json(internals["x13_raw_tensor"])
-        st.markdown("**x13_norm_tensor**")
-        st.json(internals["x13_norm_tensor"])
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-        st.markdown("### B) Segmentation Output (Logits)")
-        st.json(internals["logits"])
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with right:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### C) Sigmoid Probabilities")
-        st.json(internals["probs"])
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-        st.markdown("### D) Thresholding Output (Binary Mask)")
-        st.json(internals["mask"])
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # ========================================================
-    # VISUALIZATION & PRODUCT
-    # ========================================================
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.markdown("## Visualization & Product (Notebook-style)")
 
     v1, v2, v3, v4 = st.columns(4, gap="medium")
-
     v1.image((visuals["rgb"] * 255).astype(np.uint8), caption="Original (RGB composite)", use_column_width=True)
 
     if gt01 is None:
@@ -715,79 +622,37 @@ Logits → sigmoid → threshold → binary mask
         gt_ratio = float(gt01.mean())
         v2.image((gt_vis * 255).astype(np.uint8), caption=f"Ground Truth (fire ratio={gt_ratio:.4f})", use_column_width=True)
 
-    # CHANGED: slot #3 now B/W binary mask (as you requested)
-    v3.image((visuals["pred_bin_bw"] * 255).astype(np.uint8),
-             caption="Prediction (binary mask, B/W)",
+    # <<< CHANGED: slot #3 now raw sigmoid overlay (like your image 2)
+    v3.image((visuals["pred_prob_overlay"] * 255).astype(np.uint8),
+             caption="Prediction (raw sigmoid overlay)",
              use_column_width=True)
 
+    # slot #4 remains binary overlay / product
     v4.image((visuals["pred_bin_overlay"] * 255).astype(np.uint8),
              caption="Prediction (binary overlay / product)",
              use_column_width=True)
 
-    # ========================================================
-    # METRICS SUMMARY
-    # ========================================================
     st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("## Model Quick Summary")
+    st.markdown(f"## {DISPLAY_NAME.get(model_key, model_key)}")
 
     dfm = load_metrics_df(model_key)
-    if dfm.empty:
-        st.warning("No metrics file found/readable for this model.")
+    table = build_train_val_test_table(dfm, model_key)
+
+    row = best_overall_row(dfm)
+    if row is not None:
+        run_str = str(row.get("run", ""))
+        ep_str = str(int(row.get("epoch", -1))) if "epoch" in row.index else ""
+        st.markdown(
+            f'<div class="small">Train/Val taken from best epoch (best va_f1) → run: <b>{run_str}</b>, epoch: <b>{ep_str}</b>. Test is hard-coded (TEST_METRICS).</div>',
+            unsafe_allow_html=True
+        )
     else:
-        auc_col = pick_auc_column(dfm)
-        best_overall, best_per_run = metrics_best_rows(dfm)
+        st.markdown(
+            '<div class="small">Train/Val table not found in metrics file (or `va_f1` missing). Test is still shown from TEST_METRICS.</div>',
+            unsafe_allow_html=True
+        )
 
-        if best_overall is None or best_per_run.empty:
-            st.warning("Metrics file loaded, but required column `va_f1` was not found.")
-        else:
-            cA, cB, cC, cD = st.columns(4)
-            cA.metric("Best overall run", str(best_overall.get("run", "")))
-            cB.metric("Best overall epoch", str(int(best_overall.get("epoch", -1))))
-            cC.metric("Best overall va_f1", f"{float(best_overall.get('va_f1', 0.0)):.4f}")
-            if auc_col:
-                cD.metric("Below are the evaluation results of the model retrained with an adjusted threshold.")
-            else:
-                cD.metric("va_pr_auc", "N/A")
-
-            cols_to_show = ["run", "epoch", "va_loss", "va_precision", "va_recall", "va_f1"]
-            if auc_col:
-                cols_to_show.append(auc_col)
-            if "seconds" in dfm.columns:
-                cols_to_show.append("seconds")
-            cols_to_show = [c for c in cols_to_show if c in dfm.columns]
-
-            st.markdown("### Best epoch per run (va_f1)")
-            st.dataframe(
-                best_per_run[cols_to_show].rename(columns={auc_col: "va_pr_auc"} if auc_col else {}),
-                use_container_width=True
-            )
-
-            st.markdown("### Top-5 overall epochs (va_f1)")
-            top5 = dfm.sort_values("va_f1", ascending=False).head(5)
-            st.dataframe(
-                top5[cols_to_show].rename(columns={auc_col: "va_pr_auc"} if auc_col else {}),
-                use_container_width=True
-            )
-
-    # ========================================================
-    # TEST METRICS (HARD-CODED)
-    # ========================================================
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("### Test Metrics (hard-coded)")
-
-    tm = TEST_METRICS.get(model_key)
-    if tm is None:
-        st.info("Test metrics for this model are not provided yet.")
-    else:
-        df_test = pd.DataFrame([{
-            "test_loss": tm.get("test_loss"),
-            "test_precision": tm.get("test_precision"),
-            "test_recall": tm.get("test_recall"),
-            "test_f1": tm.get("test_f1"),
-            "test_acc": tm.get("test_acc"),
-            "test_pr_auc": tm.get("test_pr_auc"),
-        }])
-        st.dataframe(df_test, use_container_width=True)
+    st.dataframe(table, use_container_width=True)
 
     st.markdown(
         '<div class="small" style="margin-top:10px;">Notes: This app is pixel-wise only. Patch-level aggregation is removed.</div>',
@@ -796,15 +661,17 @@ Logits → sigmoid → threshold → binary mask
 
 
 # ============================================================
-# TAB 2 — COMPARISON (visual only)
+# TAB 2 — COMPARISON (visual only)  ✅ 5 images: RGB + GT + 3 overlays
 # ============================================================
 with tab_compare:
     st.subheader("Model Comparison (Visual Only)")
 
+    all_models = list(WEIGHTS.keys())
+
     models = st.multiselect(
-        "Select models to compare",
-        list(WEIGHTS.keys()),
-        default=list(WEIGHTS.keys())[:2],
+        "Select models to compare (max 3 overlays will be shown)",
+        all_models,
+        default=all_models,
         key="compare_models",
         format_func=lambda k: DISPLAY_NAME.get(k, k),
     )
@@ -815,31 +682,45 @@ with tab_compare:
         key="compare_upload",
     )
 
-    if uploaded2 is None:
-        st.info("Choose models, then upload a .npz file to compare overlays.")
-        st.stop()
+    t_cmp = st.slider("Threshold for comparison", 0.00, 1.00, 0.05, 0.01)
 
-    if not models:
-        st.warning("Select at least one model.")
+    if uploaded2 is None:
+        st.info("Upload a .npz file to compare overlays across models.")
         st.stop()
 
     try:
-        x13c, _gt_unused = load_npz_from_bytes(uploaded2.getvalue())
+        x13c, gt01c = load_npz_from_bytes(uploaded2.getvalue())
     except Exception as e:
         st.error(f"Failed to read NPZ: {e}")
         st.stop()
 
     rgb = to_rgb_for_display(x13c)
 
+    models_ordered = [m for m in all_models if m in models]
+    models_show = models_ordered[:3]
+
     st.markdown("### Overlays (same input, different models)")
-    cols = st.columns(len(models) + 1, gap="medium")
+
+    cols = st.columns(5, gap="medium")
+
     cols[0].image((rgb * 255).astype(np.uint8), caption="RGB", use_column_width=True)
 
-    for i, m in enumerate(models):
-        visuals_m, _, _, _ = infer_with_internals(m, x13c)
-        cols[i + 1].image(
-            (visuals_m["pred_bin_overlay"] * 255).astype(np.uint8),
-            caption=DISPLAY_NAME.get(m, m),
-            use_column_width=True
-        )
+    if gt01c is None:
+        cols[1].warning("GT not found (missing key: label)")
+    else:
+        gt_vis = red_mask_on_white(gt01c)
+        gt_ratio = float(gt01c.mean())
+        cols[1].image((gt_vis * 255).astype(np.uint8), caption=f"Ground Truth (ratio={gt_ratio:.4f})", use_column_width=True)
 
+    for j in range(3):
+        col_idx = 2 + j
+        if j < len(models_show):
+            m = models_show[j]
+            visuals_m, _, _, _ = infer_with_internals(m, x13c, t_used=float(t_cmp))
+            cols[col_idx].image(
+                (visuals_m["pred_bin_overlay"] * 255).astype(np.uint8),
+                caption=DISPLAY_NAME.get(m, m),
+                use_column_width=True
+            )
+        else:
+            cols[col_idx].info("Select more models (up to 3) to fill this slot.")
