@@ -154,6 +154,22 @@ ARCH = {
 }
 
 TEST_METRICS = {
+    "U-Net (JP retrained)": {
+        "test_loss": 0.0741,
+        "test_precision": 0.7120,
+        "test_recall": 0.6341,
+        "test_f1": 0.6708,
+        "test_acc": 0.9849,
+        "test_pr_auc": 0.9381,
+    },
+    "U-Net Eff (EfficientNet-B4)": {
+        "test_loss": 0.0501,
+        "test_precision": 0.7206,
+        "test_recall": 0.7792,
+        "test_f1": 0.7488,
+        "test_acc": 0.9873,
+        "test_pr_auc": 0.7971,
+    },
     "DeepLabV3+ (EfficientNet-B4) — pretrained": {
         "test_loss": 0.0682,
         "test_precision": 0.6771,
@@ -826,3 +842,4 @@ with tab_compare:
             caption=DISPLAY_NAME.get(m, m),
             use_column_width=True
         )
+
