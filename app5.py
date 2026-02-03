@@ -18,6 +18,8 @@ import pandas as pd
 import torch
 import streamlit as st
 import segmentation_models_pytorch as smp
+import torch.nn.functional as F
+import matplotlib.cm as cm
 
 # Optional (PR AUC / Average Precision)
 try:
@@ -125,7 +127,7 @@ METRICS = {
 }
 
 T_BEST = {
-    "U-Net (JP retrained)": 0.15,
+    "U-Net (JP retrained)": 0.05,
     "U-Net Eff (EfficientNet-B4)": 0.05,
     "DeepLabV3+ (EfficientNet-B4) — pretrained": 0.05,
 }
@@ -172,7 +174,7 @@ TEST_METRICS = {
 RGB_IDXS = (0, 1, 2)
 
 DISPLAY_NAME = {
-    "U-Net (JP retrained)": "U-Net + Resnet18 (thr: 0.15)",
+    "U-Net (JP retrained)": "U-Net + Resnet18 (thr: 0.05)",
     "U-Net Eff (EfficientNet-B4)": "U-Net + EfficientNet-b4 (thr: 0.05)",
     "DeepLabV3+ (EfficientNet-B4) — pretrained": "DeepLabV3Plus + EfficientNet-b4 (thr: 0.05)",
 }
@@ -300,6 +302,113 @@ def red_mask_on_white(mask01: np.ndarray) -> np.ndarray:
     out[..., 1] = 1.0 - 0.85 * m
     out[..., 2] = 1.0 - 0.85 * m
     return out
+
+
+
+def binary_mask_red_on_white(mask01: np.ndarray) -> np.ndarray:
+    """
+    Fire = red, Non-fire = white
+    SAME for Ground Truth and Prediction
+    """
+    m = (mask01 > 0.5).astype(np.float32)
+    out = np.ones((m.shape[0], m.shape[1], 3), dtype=np.float32)
+    out[..., 1] = 1.0 - 0.85 * m   # reduce G
+    out[..., 2] = 1.0 - 0.85 * m   # reduce B
+    return out
+
+def swir_for_display(x13: np.ndarray, swir_idx=11) -> np.ndarray:
+    swir = x13[swir_idx]
+    lo, hi = np.percentile(swir, 2), np.percentile(swir, 98)
+    swir_n = np.clip((swir - lo) / (hi - lo + 1e-6), 0, 1)
+    return swir_n
+
+def aggregate_binary_mask_area(
+    mask01: np.ndarray,
+    block: int = 56,
+    min_fire_pixels: int = 314,  # 🔥 threshold area
+) -> np.ndarray:
+    """
+    Spatial aggregation based on MINIMUM FIRE PIXELS per block.
+    """
+    x = torch.from_numpy(mask01).unsqueeze(0).unsqueeze(0).float()  # (1,1,H,W)
+
+    # sum pooling → jumlah pixel api
+    pooled_sum = F.avg_pool2d(
+        x,
+        kernel_size=block,
+        stride=block
+    ) * (block * block)
+
+    # decision based on area
+    agg = (pooled_sum >= min_fire_pixels).float()
+
+    # upsample back to original size
+    up = F.interpolate(agg, size=mask01.shape, mode="nearest")
+
+    return up[0, 0].numpy()
+
+
+
+
+
+
+VIS_BLOK_CFG = {
+    "U-Net (JP retrained)": {"t_best": 0.05, "min_pixel": 1000.0, "blok_pixel": 64, "swir_idx": 10},
+    "U-Net Eff (EfficientNet-B4)": {"t_best": 0.05, "min_pixel": 448.0,  "blok_pixel": 56, "swir_idx": 10},
+    "DeepLabV3+ (EfficientNet-B4) — pretrained": {"t_best": 0.05, "min_pixel": 1000.0, "blok_pixel": 64, "swir_idx": 10},
+}
+
+def swir_minmax_for_display(x13: np.ndarray, swir_idx: int = 10) -> np.ndarray:
+    """
+    Match notebook:
+      swir_vis = (swir - swir.min()) / (swir.max() - swir.min() + 1e-8)
+    """
+    swir = x13[swir_idx].astype(np.float32)
+    return (swir - swir.min()) / (swir.max() - swir.min() + 1e-8)
+
+def reds_cmap_img(arr01: np.ndarray) -> np.ndarray:
+    """
+    Match notebook: imshow(arr, cmap="Reds")
+    Input: 2D array (0..1)
+    Output: uint8 RGB (H,W,3)
+    """
+    a = np.clip(arr01.astype(np.float32), 0.0, 1.0)
+    rgba = cm.get_cmap("Reds")(a)     # (H,W,4)
+    rgb = rgba[..., :3]               # (H,W,3)
+    return (rgb * 255).astype(np.uint8)
+
+def blockify_and_threshold_like_nb(pred_map: np.ndarray, block_size: int, threshold: float) -> np.ndarray:
+    """
+    Match notebook function exactly (loop blocks, SUM values, compare to threshold):
+      fire_pixels = sum(block)
+      if fire_pixels >= threshold -> set whole block to 1
+    Note: in notebook preview they pass probs[i,0] (raw sigmoid), not binary.
+    """
+    H, W = pred_map.shape
+    blocked = np.zeros((H, W), dtype=np.float32)
+
+    for i in range(0, H, block_size):
+        for j in range(0, W, block_size):
+            block = pred_map[i:i+block_size, j:j+block_size]
+            fire_pixels = float(block.sum())
+            if fire_pixels >= float(threshold):
+                blocked[i:i+block_size, j:j+block_size] = 1.0
+
+    return blocked
+
+
+
+
+
+# ============================================================
+# AGGREGATION PARAMETERS (AREA-BASED)
+# ============================================================
+AGG_BLOCK = 56                 # 56 × 56 pixel
+MIN_FIRE_PIXELS = 314          # ~10% area of 56×56 block
+
+
+
+
 
 
 def infer_with_internals(model_key: str, x13: np.ndarray, t_used: float):
@@ -610,27 +719,60 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
         st.info("No Ground Truth `label` found → patch metrics not computed.")
 
     st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("## Visualization & Product (Notebook-style)")
+    
+    
+    st.markdown("## Visualization")
+    st.caption(
+        "**Note:** Red area represents fire pixels, while white area represents non-fire pixels "
+        "in both the Ground Truth and the Binary Fire Map."
+    )
+
+    # --- notebook-style params (vis-blok-all_final.ipynb) ---
+    cfg = VIS_BLOK_CFG.get(model_key, {"t_best": 0.05, "min_pixel": 448.0, "blok_pixel": 56, "swir_idx": 10})
+    t_vis = float(cfg["t_best"])
+    min_pixel = float(cfg["min_pixel"])
+    blok_pixel = int(cfg["blok_pixel"])
+    swir_idx = int(cfg["swir_idx"])
+
+    # area seperti notebook: mask = (probs >= t_best) lalu mean()
+    area_val = float((probs_np >= t_vis).astype(np.float32).mean())
+    patch_name = uploaded.name if hasattr(uploaded, "name") else "patch"
 
     v1, v2, v3, v4 = st.columns(4, gap="medium")
-    v1.image((visuals["rgb"] * 255).astype(np.uint8), caption="Original (RGB composite)", use_column_width=True)
 
+    # 1) SWIR (min-max) + title patch & area
+    swir_vis = swir_minmax_for_display(x13, swir_idx=swir_idx)
+    v1.image(
+        (swir_vis * 255).astype(np.uint8),
+        caption=f"{patch_name}\nSWIR | Area={area_val:.4f}",
+        use_column_width=True
+    )
+
+    # 2) Ground Truth (Reds)
     if gt01 is None:
-        v2.warning("Ground Truth not found (missing key: label)")
+        v2.warning("Ground Truth not found")
     else:
-        gt_vis = red_mask_on_white(gt01)
-        gt_ratio = float(gt01.mean())
-        v2.image((gt_vis * 255).astype(np.uint8), caption=f"Ground Truth (fire ratio={gt_ratio:.4f})", use_column_width=True)
+        v2.image(
+            reds_cmap_img(gt01),
+            caption="Ground Truth",
+            use_column_width=True
+        )
 
-    # <<< CHANGED: slot #3 now raw sigmoid overlay (like your image 2)
-    v3.image((visuals["pred_prob_overlay"] * 255).astype(np.uint8),
-             caption="Prediction (raw sigmoid overlay)",
-             use_column_width=True)
+    # 3) Prediction (raw sigmoid) (Reds gradient)
+    v3.image(
+        reds_cmap_img(probs_np),
+        caption="Prediction (raw sigmoid)",
+        use_column_width=True
+    )
 
-    # slot #4 remains binary overlay / product
-    v4.image((visuals["pred_bin_overlay"] * 255).astype(np.uint8),
-             caption="Prediction (binary overlay / product)",
-             use_column_width=True)
+    # 4) Prediction (blockified) (Reds)
+    mask_block = blockify_and_threshold_like_nb(probs_np, blok_pixel, min_pixel)
+    v4.image(
+        reds_cmap_img(mask_block),
+        caption="Prediction (blockified)",
+        use_column_width=True
+    )
+
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.markdown(f"## {DISPLAY_NAME.get(model_key, model_key)}")
@@ -661,7 +803,8 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
 
 
 # ============================================================
-# TAB 2 — COMPARISON (visual only)  ✅ 5 images: RGB + GT + 3 overlays
+# TAB 2 — COMPARISON (visual only)
+# SWIR + GT + 3 aggregated binary predictions (56x56)
 # ============================================================
 with tab_compare:
     st.subheader("Model Comparison (Visual Only)")
@@ -669,7 +812,7 @@ with tab_compare:
     all_models = list(WEIGHTS.keys())
 
     models = st.multiselect(
-        "Select models to compare (max 3 overlays will be shown)",
+        "Select models to compare (max 3 will be shown)",
         all_models,
         default=all_models,
         key="compare_models",
@@ -682,10 +825,8 @@ with tab_compare:
         key="compare_upload",
     )
 
-    t_cmp = st.slider("Threshold for comparison", 0.00, 1.00, 0.05, 0.01)
-
     if uploaded2 is None:
-        st.info("Upload a .npz file to compare overlays across models.")
+        st.info("Upload a .npz file to compare models.")
         st.stop()
 
     try:
@@ -694,32 +835,57 @@ with tab_compare:
         st.error(f"Failed to read NPZ: {e}")
         st.stop()
 
-    rgb = to_rgb_for_display(x13c)
+    # SWIR visualization
+    # SWIR visualization (notebook-style: min-max, swir_idx=10)
+    swir = swir_minmax_for_display(x13c, swir_idx=10)
 
     models_ordered = [m for m in all_models if m in models]
     models_show = models_ordered[:3]
 
-    st.markdown("### Overlays (same input, different models)")
+    st.markdown("### Model Comparison")
+    st.caption(
+        "**Note:** Ground Truth, raw sigmoid, and blockified maps use `Reds` colormap "
+    )
 
     cols = st.columns(5, gap="medium")
 
-    cols[0].image((rgb * 255).astype(np.uint8), caption="RGB", use_column_width=True)
+    # 1️⃣ SWIR
+    cols[0].image(
+        (swir * 255).astype(np.uint8),
+        caption="SWIR",
+        use_column_width=True
+    )
 
+    # 2️⃣ Ground Truth (Reds)
     if gt01c is None:
-        cols[1].warning("GT not found (missing key: label)")
+        cols[1].warning("Ground Truth not found (missing key: label)")
     else:
-        gt_vis = red_mask_on_white(gt01c)
-        gt_ratio = float(gt01c.mean())
-        cols[1].image((gt_vis * 255).astype(np.uint8), caption=f"Ground Truth (ratio={gt_ratio:.4f})", use_column_width=True)
+        cols[1].image(
+            reds_cmap_img(gt01c),
+            caption="Ground Truth",
+            use_column_width=True
+        )
 
+    # 3️⃣–5️⃣ Model predictions (blockified from probs, notebook-style)
     for j in range(3):
         col_idx = 2 + j
         if j < len(models_show):
             m = models_show[j]
-            visuals_m, _, _, _ = infer_with_internals(m, x13c, t_used=float(t_cmp))
+
+            # inference (we only need probs)
+            t_model = float(T_BEST[m])
+            _, _, probs_m, _ = infer_with_internals(m, x13c, t_used=t_model)
+
+            # notebook config per model (k/min_pixel/t_best)
+            cfgm = VIS_BLOK_CFG.get(m, {"t_best": 0.05, "min_pixel": 448.0, "blok_pixel": 56, "swir_idx": 10})
+            km = int(cfgm["blok_pixel"])
+            minpm = float(cfgm["min_pixel"])
+
+            blk = blockify_and_threshold_like_nb(probs_m, km, minpm)
+
             cols[col_idx].image(
-                (visuals_m["pred_bin_overlay"] * 255).astype(np.uint8),
-                caption=DISPLAY_NAME.get(m, m),
+                reds_cmap_img(blk),
+                caption=f"{DISPLAY_NAME.get(m, m)}\nPrediction (blockified) k={km} min_pixel={minpm:.0f}",
                 use_column_width=True
             )
         else:
