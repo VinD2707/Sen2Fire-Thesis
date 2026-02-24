@@ -355,16 +355,12 @@ def aggregate_binary_mask_area(
 VIS_BLOK_CFG = {
     "U-Net (JP retrained)": {"t_best": 0.05, "min_pixel": 1000.0, "blok_pixel": 64, "swir_idx": 10},
     "U-Net Eff (EfficientNet-B4)": {"t_best": 0.05, "min_pixel": 448.0,  "blok_pixel": 56, "swir_idx": 10},
-    "DeepLabV3+ (EfficientNet-B4) — pretrained": {"t_best": 0.05, "min_pixel": 1000.0, "blok_pixel": 64, "swir_idx": 10},
+    "DeepLabV3+ (EfficientNet-B4) — pretrained": {"t_best": 0.05, "min_pixel": 1000.0, "blok_pixel": 96, "swir_idx": 10},
 }
 
 def swir_minmax_for_display(x13: np.ndarray, swir_idx: int = 10) -> np.ndarray:
-    """
-    Match notebook:
-      swir_vis = (swir - swir.min()) / (swir.max() - swir.min() + 1e-8)
-    """
     swir = x13[swir_idx].astype(np.float32)
-    return (swir - swir.min()) / (swir.max() - swir.min() + 1e-8)
+    return stretch01(swir, p1=1, p2=99)
 
 def reds_cmap_img(arr01: np.ndarray) -> np.ndarray:
     """
@@ -398,8 +394,6 @@ def blockify_and_threshold_like_nb(pred_map: np.ndarray, block_size: int, thresh
 
 
 
-
-
 # ============================================================
 # AGGREGATION PARAMETERS (AREA-BASED)
 # ============================================================
@@ -407,17 +401,50 @@ AGG_BLOCK = 56                 # 56 × 56 pixel
 MIN_FIRE_PIXELS = 314          # ~10% area of 56×56 block
 
 
+from scipy.ndimage import label as cc_label
+from scipy.ndimage import binary_opening, binary_closing, binary_fill_holes
+
+def stretch01(img, p1=2, p2=98):
+    a = img.astype(np.float32)
+    lo = np.nanpercentile(a, p1)
+    hi = np.nanpercentile(a, p2)
+    return np.clip((a - lo) / (hi - lo + 1e-6), 0, 1)
+
+
+def cca_process(mask01: np.ndarray, min_pixels=2582, connectivity=2):
+    if connectivity == 1:
+        structure = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=np.uint8)
+    else:
+        structure = np.ones((3,3), dtype=np.uint8)
+
+    labeled, n = cc_label(mask01.astype(bool), structure=structure)
+    out = np.zeros_like(mask01, dtype=np.uint8)
+
+    for i in range(1, n+1):
+        comp = (labeled == i)
+        if comp.sum() >= min_pixels:
+            out[comp] = 1
+    return out
+
+
+def make_guidance_rgb_from_xraw(x_raw_chw):
+    green = x_raw_chw[2]
+    nir   = x_raw_chw[7]
+    swir2 = x_raw_chw[11]
+
+    rgb = np.stack([nir, swir2, green], axis=-1)
+    return (stretch01(rgb) * 255).astype(np.uint8)
+
+
+
+
+
 
 
 
 
 def infer_with_internals(model_key: str, x13: np.ndarray, t_used: float):
-    """
-    Returns:
-      visuals: rgb, pred_prob_overlay, pred_bin_overlay
-      internals: dict (kept internal)
-      raw arrays: probs_np, mask_np
-    """
+
     device = get_device()
     model = load_model_cached(model_key)
 
@@ -426,39 +453,56 @@ def infer_with_internals(model_key: str, x13: np.ndarray, t_used: float):
 
     x13p = x13.astype(np.float32)
 
-    if apply_scale_clip:
-        if scale_div is not None:
-            x13p = x13p / float(scale_div)
-        if clip is not None and isinstance(clip, (list, tuple)) and len(clip) == 2:
-            lo, hi = float(clip[0]), float(clip[1])
-            x13p = np.clip(x13p, lo, hi)
-
-    x_raw = torch.from_numpy(x13p).unsqueeze(0).to(device)   # (1,13,H,W)
+    x_raw = torch.from_numpy(x13p).unsqueeze(0).to(device)
     x_norm = normalize_batch(x_raw, mean_13, std_13)
 
-    t0 = time.perf_counter()
     with torch.no_grad():
-        logits = model(x_norm)                 # (1,1,H,W)
-        probs  = torch.sigmoid(logits)         # (1,1,H,W)
-        mask   = (probs >= float(t_used)).float()
-    t1 = time.perf_counter()
+        logits = model(x_norm)
+        probs  = torch.sigmoid(logits)
 
-    probs_np  = probs[0, 0].detach().cpu().numpy()
-    mask_np   = mask[0, 0].detach().cpu().numpy()
+    probs_np = probs[0,0].detach().cpu().numpy().astype(np.float32)
+
+    # ===============================
+    # PIPELINE 2
+    # ===============================
+
+    # 1️⃣ CRF
+    guide = make_guidance_rgb_from_xraw(x13)
+    try:
+        import pydensecrf.densecrf as dcrf
+        from pydensecrf.utils import unary_from_softmax
+
+        H, W = probs_np.shape
+        d = dcrf.DenseCRF2D(W, H, 2)
+
+        soft = np.zeros((2,H,W), dtype=np.float32)
+        soft[1] = probs_np
+        soft[0] = 1 - probs_np
+        U = unary_from_softmax(soft)
+        d.setUnaryEnergy(U)
+        d.addPairwiseGaussian(sxy=3, compat=3)
+        d.addPairwiseBilateral(sxy=50, srgb=10, rgbim=guide, compat=5)
+
+        Q = np.array(d.inference(5)).reshape(2,H,W)
+        probs_np = Q[1]
+    except:
+        pass
+
+    # 2️⃣ Static Threshold
+    mask_np = (probs_np >= 0.05).astype(np.uint8)
+
+    # 3️⃣ CCA
+    mask_np = cca_process(mask_np, min_pixels=2582)
 
     rgb = to_rgb_for_display(x13)
 
     visuals = {
         "rgb": rgb,
-        "pred_prob_overlay": overlay_probabilities(rgb, probs_np, alpha=0.55),   # <<< ini yang kamu mau (gambar 2)
-        "pred_bin_overlay": overlay_binary(rgb, mask_np, alpha=0.4),             # product
+        "pred_prob_overlay": overlay_probabilities(rgb, probs_np),
+        "pred_bin_overlay": overlay_binary(rgb, mask_np),
     }
 
-    internals = {
-        "device": str(device),
-        "t_used": float(t_used),
-        "infer_s": float(t1 - t0),
-    }
+    internals = {}
 
     return visuals, internals, probs_np, mask_np
 
@@ -607,7 +651,7 @@ hr { border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 18px 0;
 # HEADER
 # ============================================================
 st.title("Sen2Fire — Pixel-wise Segmentation")
-st.markdown("Segmentation (logits) → sigmoid → data-driven threshold (validation-derived) → visualization & product.")
+st.markdown("Segmentation (logits) → sigmoid → CRF → static threshold (0.05) → CCA (min_pixels=2582)")
 
 # validate paths early
 missing = []
@@ -738,19 +782,19 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
     area_val = float((probs_np >= t_vis).astype(np.float32).mean())
     patch_name = uploaded.name if hasattr(uploaded, "name") else "patch"
 
-    v1, v2, v3, v4 = st.columns(4, gap="medium")
+    v1, v2, v3, v4, v5 = st.columns(5, gap="medium")
 
-    # 1) SWIR (min-max) + title patch & area
+    # SWIR
     swir_vis = swir_minmax_for_display(x13, swir_idx=swir_idx)
     v1.image(
-        (swir_vis * 255).astype(np.uint8),
-        caption=f"{patch_name}\nSWIR | Area={area_val:.4f}",
-        use_column_width=True
+       (swir_vis * 255).astype(np.uint8),
+       caption=f"{patch_name}\nSWIR | Area={area_val:.4f}",
+       use_column_width=True
     )
 
-    # 2) Ground Truth (Reds)
+    # Ground Truth
     if gt01 is None:
-        v2.warning("Ground Truth not found")
+       v2.warning("Ground Truth not found") 
     else:
         v2.image(
             reds_cmap_img(gt01),
@@ -758,18 +802,25 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
             use_column_width=True
         )
 
-    # 3) Prediction (raw sigmoid) (Reds gradient)
+    # Sigmoid Prediction (RAW)
     v3.image(
         reds_cmap_img(probs_np),
-        caption="Prediction (raw sigmoid)",
+        caption="Sigmoid Prediction (Raw)",
         use_column_width=True
     )
 
-    # 4) Prediction (blockified) (Reds)
-    mask_block = blockify_and_threshold_like_nb(probs_np, blok_pixel, min_pixel)
+    # Final Binary (CRF + Threshold + CCA)
     v4.image(
+        reds_cmap_img(mask_np),
+        caption="Final Binary (CRF + Static Thr + CCA)",
+        use_column_width=True
+    )
+
+    # Blockified (Area-level)
+    mask_block = blockify_and_threshold_like_nb(probs_np, blok_pixel, min_pixel)
+    v5.image(
         reds_cmap_img(mask_block),
-        caption="Prediction (blockified)",
+        caption=f"Blockified (k={blok_pixel})",
         use_column_width=True
     )
 
@@ -807,8 +858,26 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
 # SWIR + GT + 3 aggregated binary predictions (56x56)
 # ============================================================
 with tab_compare:
-    st.subheader("Model Comparison (Visual Only)")
 
+    # ========================================================
+    # HEADER + TOGGLE (KANAN ATAS)
+    # ========================================================
+    header_cols = st.columns([3, 2])
+
+    with header_cols[0]:
+        st.subheader("Model Comparison (Visual Only)")
+
+    with header_cols[1]:
+        viz_mode = st.radio(
+            "Visualization Mode",
+            ["Visualize by Block", "Visualize by Sigmoid Binary Mask"],
+            horizontal=True,
+            key="viz_mode_compare",
+        )
+
+    # ========================================================
+    # MODEL SELECTION
+    # ========================================================
     all_models = list(WEIGHTS.keys())
 
     models = st.multiselect(
@@ -819,6 +888,9 @@ with tab_compare:
         format_func=lambda k: DISPLAY_NAME.get(k, k),
     )
 
+    # ========================================================
+    # FILE UPLOAD
+    # ========================================================
     uploaded2 = st.file_uploader(
         "Upload test patch (.npz)",
         type=["npz"],
@@ -835,8 +907,9 @@ with tab_compare:
         st.error(f"Failed to read NPZ: {e}")
         st.stop()
 
-    # SWIR visualization
-    # SWIR visualization (notebook-style: min-max, swir_idx=10)
+    # ========================================================
+    # SWIR VISUALIZATION
+    # ========================================================
     swir = swir_minmax_for_display(x13c, swir_idx=10)
 
     models_ordered = [m for m in all_models if m in models]
@@ -844,19 +917,23 @@ with tab_compare:
 
     st.markdown("### Model Comparison")
     st.caption(
-        "**Note:** Ground Truth, raw sigmoid, and blockified maps use `Reds` colormap "
+        "**Note:** Ground Truth, raw sigmoid, and blockified maps use `Reds` colormap"
     )
 
     cols = st.columns(5, gap="medium")
 
+    # ========================================================
     # 1️⃣ SWIR
+    # ========================================================
     cols[0].image(
         (swir * 255).astype(np.uint8),
         caption="SWIR",
         use_column_width=True
     )
 
-    # 2️⃣ Ground Truth (Reds)
+    # ========================================================
+    # 2️⃣ GROUND TRUTH
+    # ========================================================
     if gt01c is None:
         cols[1].warning("Ground Truth not found (missing key: label)")
     else:
@@ -866,27 +943,66 @@ with tab_compare:
             use_column_width=True
         )
 
-    # 3️⃣–5️⃣ Model predictions (blockified from probs, notebook-style)
+    # ========================================================
+    # 3️⃣–5️⃣ MODEL PREDICTIONS
+    # ========================================================
     for j in range(3):
+
         col_idx = 2 + j
+
         if j < len(models_show):
+
             m = models_show[j]
 
-            # inference (we only need probs)
+            # inference
             t_model = float(T_BEST[m])
-            _, _, probs_m, _ = infer_with_internals(m, x13c, t_used=t_model)
+            _, _, probs_m, _ = infer_with_internals(
+                m,
+                x13c,
+                t_used=t_model
+            )
 
-            # notebook config per model (k/min_pixel/t_best)
-            cfgm = VIS_BLOK_CFG.get(m, {"t_best": 0.05, "min_pixel": 448.0, "blok_pixel": 56, "swir_idx": 10})
+            # notebook config per model
+            cfgm = VIS_BLOK_CFG.get(
+                m,
+                {
+                    "t_best": 0.05,
+                    "min_pixel": 448.0,
+                    "blok_pixel": 56,
+                    "swir_idx": 10
+                }
+            )
+
             km = int(cfgm["blok_pixel"])
             minpm = float(cfgm["min_pixel"])
 
-            blk = blockify_and_threshold_like_nb(probs_m, km, minpm)
+            # =================================================
+            # VISUALIZATION MODE SWITCH
+            # =================================================
+            if viz_mode == "Visualize by Block":
+                pred_vis = blockify_and_threshold_like_nb(
+                    probs_m,
+                    km,
+                    minpm
+                )
+                caption_txt = (
+                    f"{DISPLAY_NAME.get(m, m)}\n"
+                    f"Prediction (Blockified k={km})"
+                )
+            else:
+                pred_vis = (probs_m >= t_model).astype(np.uint8)
+                caption_txt = (
+                    f"{DISPLAY_NAME.get(m, m)}\n"
+                    f"Prediction (Sigmoid Binary)"
+                )
 
             cols[col_idx].image(
-                reds_cmap_img(blk),
-                caption=f"{DISPLAY_NAME.get(m, m)}\nPrediction (blockified) k={km} min_pixel={minpm:.0f}",
+                reds_cmap_img(pred_vis),
+                caption=caption_txt,
                 use_column_width=True
             )
+
         else:
-            cols[col_idx].info("Select more models (up to 3) to fill this slot.")
+            cols[col_idx].info(
+                "Select more models (up to 3) to fill this slot."
+            )
