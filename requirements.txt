@@ -1,5 +1,5 @@
 streamlit
-numpy
+numpy<2
 pandas
 torch
 torchvision
@@ -9,4 +9,5 @@ scikit-learn
 matplotlib
 scipy
 openpyxl
-pydensecrf
+cython==0.29.36
+pydensecrf @ git+https://github.com/lucasb-eyer/pydensecrf.git
