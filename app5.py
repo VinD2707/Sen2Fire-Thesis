@@ -373,21 +373,39 @@ def reds_cmap_img(arr01: np.ndarray) -> np.ndarray:
     rgb = rgba[..., :3]               # (H,W,3)
     return (rgb * 255).astype(np.uint8)
 
-def blockify_and_threshold_like_nb(pred_map: np.ndarray, block_size: int, threshold: float) -> np.ndarray:
+def blockify_and_threshold_like_nb(
+    pred_map: np.ndarray,
+    block_size: int,
+    threshold: float,
+    binarize: bool = True,
+    bin_thr: float = 0.5
+) -> np.ndarray:
     """
-    Match notebook function exactly (loop blocks, SUM values, compare to threshold):
-      fire_pixels = sum(block)
-      if fire_pixels >= threshold -> set whole block to 1
-    Note: in notebook preview they pass probs[i,0] (raw sigmoid), not binary.
+    Blockify berdasarkan JUMLAH PIXEL API per block (bukan sum probabilitas).
+
+    pred_map:
+      - idealnya binary mask {0,1}
+      - kalau masih probabilitas, set binarize=True (default), maka jadi (pred_map >= bin_thr)
+
+    threshold:
+      - min_pixel, yaitu minimal jumlah pixel api dalam satu block
     """
     H, W = pred_map.shape
+
+    if binarize:
+        pm = (pred_map >= float(bin_thr)).astype(np.uint8)
+    else:
+        pm = pred_map.astype(np.uint8)
+
     blocked = np.zeros((H, W), dtype=np.float32)
+
+    thr = int(threshold)
 
     for i in range(0, H, block_size):
         for j in range(0, W, block_size):
-            block = pred_map[i:i+block_size, j:j+block_size]
-            fire_pixels = float(block.sum())
-            if fire_pixels >= float(threshold):
+            block = pm[i:i+block_size, j:j+block_size]
+            fire_pixels = int(block.sum())
+            if fire_pixels >= thr:
                 blocked[i:i+block_size, j:j+block_size] = 1.0
 
     return blocked
@@ -427,18 +445,58 @@ def cca_process(mask01: np.ndarray, min_pixels=2582, connectivity=2):
     return out
 
 
+BAND = {
+    "GREEN": 2,
+    "NIR": 7,
+    "SWIR2": 11,
+}
+
 def make_guidance_rgb_from_xraw(x_raw_chw):
-    green = x_raw_chw[2]
-    nir   = x_raw_chw[7]
-    swir2 = x_raw_chw[11]
+    g   = x_raw_chw[BAND["GREEN"]].astype(np.float32)
+    nir = x_raw_chw[BAND["NIR"]].astype(np.float32)
+    sw  = x_raw_chw[BAND["SWIR2"]].astype(np.float32)
 
-    rgb = np.stack([nir, swir2, green], axis=-1)
-    return (stretch01(rgb) * 255).astype(np.uint8)
+    rgb = np.stack([nir, sw, g], axis=-1)  # (H,W,3)
+
+    vmin = np.nanpercentile(rgb, 1)
+    vmax = np.nanpercentile(rgb, 99)
+
+    rgb = np.clip((rgb - vmin) / (vmax - vmin + 1e-6), 0, 1)
+    return np.ascontiguousarray((rgb * 255).astype(np.uint8))
 
 
+def crf_refine_probs(probs2d: np.ndarray, guide_u8: np.ndarray, crf_iters: int = 5) -> np.ndarray:
+    probs2d = np.ascontiguousarray(np.clip(probs2d.astype(np.float32), 1e-6, 1 - 1e-6))
+    guide_u8 = np.ascontiguousarray(guide_u8.astype(np.uint8))
+    H, W = probs2d.shape
 
+    try:
+        import pydensecrf.densecrf as dcrf
+        from pydensecrf.utils import unary_from_softmax
 
+        d = dcrf.DenseCRF2D(W, H, 2)
 
+        soft = np.zeros((2, H, W), dtype=np.float32)
+        soft[1] = probs2d
+        soft[0] = 1.0 - probs2d
+
+        U = unary_from_softmax(soft)
+        d.setUnaryEnergy(U)
+        d.addPairwiseGaussian(sxy=3, compat=3)
+        d.addPairwiseBilateral(sxy=50, srgb=10, rgbim=guide_u8, compat=5)  # <- compat=5 sesuai notebook
+
+        Q = np.array(d.inference(crf_iters), dtype=np.float32).reshape(2, H, W)
+        return Q[1].astype(np.float32)
+
+    except Exception:
+        # fallback bilateral filter (butuh opencv-python)
+        try:
+            import cv2
+            p8 = (probs2d * 255).astype(np.uint8)
+            p8 = cv2.bilateralFilter(p8, d=7, sigmaColor=25, sigmaSpace=25)
+            return (p8.astype(np.float32) / 255.0).astype(np.float32)
+        except Exception:
+            return probs2d
 
 
 
@@ -452,7 +510,6 @@ def infer_with_internals(model_key: str, x13: np.ndarray, t_used: float):
     mean_13, std_13, apply_scale_clip, scale_div, clip = load_norm_stats(pp["norm_path"])
 
     x13p = x13.astype(np.float32)
-
     x_raw = torch.from_numpy(x13p).unsqueeze(0).to(device)
     x_norm = normalize_batch(x_raw, mean_13, std_13)
 
@@ -460,51 +517,34 @@ def infer_with_internals(model_key: str, x13: np.ndarray, t_used: float):
         logits = model(x_norm)
         probs  = torch.sigmoid(logits)
 
-    probs_np = probs[0,0].detach().cpu().numpy().astype(np.float32)
+    # RAW sigmoid (untuk v3)
+    probs_raw = probs[0, 0].detach().cpu().numpy().astype(np.float32)
 
-    # ===============================
-    # PIPELINE 2
-    # ===============================
+    # === CRF (persis notebook) ===
+    guide = make_guidance_rgb_from_xraw(x13)                 # uint8
+    probs_crf = crf_refine_probs(probs_raw, guide, crf_iters=5)
 
-    # 1️⃣ CRF
-    guide = make_guidance_rgb_from_xraw(x13)
-    try:
-        import pydensecrf.densecrf as dcrf
-        from pydensecrf.utils import unary_from_softmax
+    # mask_thr = (probs_crf >= float(t_used)).astype(np.uint8)
+    mask_thr = (probs_raw >= float(t_used)).astype(np.uint8)
 
-        H, W = probs_np.shape
-        d = dcrf.DenseCRF2D(W, H, 2)
-
-        soft = np.zeros((2,H,W), dtype=np.float32)
-        soft[1] = probs_np
-        soft[0] = 1 - probs_np
-        U = unary_from_softmax(soft)
-        d.setUnaryEnergy(U)
-        d.addPairwiseGaussian(sxy=3, compat=3)
-        d.addPairwiseBilateral(sxy=50, srgb=10, rgbim=guide, compat=5)
-
-        Q = np.array(d.inference(5)).reshape(2,H,W)
-        probs_np = Q[1]
-    except:
-        pass
-
-    # 2️⃣ Static Threshold
-    mask_np = (probs_np >= 0.05).astype(np.uint8)
-
-    # 3️⃣ CCA
-    mask_np = cca_process(mask_np, min_pixels=2582)
+    # CCA
+    mask_final = cca_process(mask_thr, min_pixels=2582)
 
     rgb = to_rgb_for_display(x13)
 
     visuals = {
         "rgb": rgb,
-        "pred_prob_overlay": overlay_probabilities(rgb, probs_np),
-        "pred_bin_overlay": overlay_binary(rgb, mask_np),
+        "pred_prob_overlay": overlay_probabilities(rgb, probs_raw),  # v3 tebal-tipis
+        "pred_bin_overlay": overlay_binary(rgb, mask_final),
     }
 
-    internals = {}
+    internals = {
+        "t_used": float(t_used),
+        "mean_raw": float(probs_raw.mean()),
+        "mean_crf": float(probs_crf.mean()),
+    }
 
-    return visuals, internals, probs_np, mask_np
+    return visuals, internals, probs_raw, probs_crf, mask_final
 
 
 @st.cache_data
@@ -722,7 +762,8 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
     size_ok = (H == 512 and W == 512)
 
     t_used = float(T_BEST[model_key])
-    visuals, internals, probs_np, mask_np = infer_with_internals(model_key, x13, t_used=t_used)
+    # visuals, internals, probs_np, mask_np = infer_with_internals(model_key, x13, t_used=t_used)
+    visuals, internals, probs_raw, probs_np, mask_np = infer_with_internals(model_key, x13, t_used=t_used)
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.markdown("## Model Info")
@@ -748,7 +789,8 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
         st.markdown("## Selected Patch Prediction Overview")
         st.markdown('<div class="small">metrics: loss, precision, recall, f1, accuracy, PR_AUC</div>', unsafe_allow_html=True)
 
-        pm = compute_patch_metrics(gt01, probs_np, mask_np)
+        pm = compute_patch_metrics(gt01, probs_raw, mask_np)
+        # pm = compute_patch_metrics(gt01, probs_np, mask_np)
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Loss (BCE)", f"{pm['loss']:.4f}")
         c2.metric("Precision", f"{pm['precision']:.4f}")
@@ -779,7 +821,8 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
     swir_idx = int(cfg["swir_idx"])
 
     # area seperti notebook: mask = (probs >= t_best) lalu mean()
-    area_val = float((probs_np >= t_vis).astype(np.float32).mean())
+    # area_val = float((probs_np >= t_vis).astype(np.float32).mean())
+    area_val = float((probs_raw >= t_vis).astype(np.float32).mean())
     patch_name = uploaded.name if hasattr(uploaded, "name") else "patch"
 
     v1, v2, v3, v4, v5 = st.columns(5, gap="medium")
@@ -804,8 +847,8 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
 
     # Sigmoid Prediction (RAW)
     v3.image(
-        reds_cmap_img(probs_np),
-        caption="Sigmoid Prediction (Raw)",
+        reds_cmap_img(probs_raw),
+        caption="Sigmoid Prediction (Raw Probability)",
         use_column_width=True
     )
 
@@ -817,7 +860,18 @@ Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary m
     )
 
     # Blockified (Area-level)
-    mask_block = blockify_and_threshold_like_nb(probs_np, blok_pixel, min_pixel)
+    # mask_block = blockify_and_threshold_like_nb(probs_np, blok_pixel, min_pixel)
+    # mask_block = blockify_and_threshold_like_nb(probs_raw, blok_pixel, min_pixel)
+
+    mask_block = blockify_and_threshold_like_nb(
+        probs_raw,
+        # probs_np,
+        blok_pixel,
+        min_pixel,
+        binarize=True,
+        bin_thr=0.05
+    )
+    
     v5.image(
         reds_cmap_img(mask_block),
         caption=f"Blockified (k={blok_pixel})",
@@ -923,7 +977,7 @@ with tab_compare:
     cols = st.columns(5, gap="medium")
 
     # ========================================================
-    # 1️⃣ SWIR
+    # 1 SWIR
     # ========================================================
     cols[0].image(
         (swir * 255).astype(np.uint8),
@@ -932,7 +986,7 @@ with tab_compare:
     )
 
     # ========================================================
-    # 2️⃣ GROUND TRUTH
+    # 2 GROUND TRUTH
     # ========================================================
     if gt01c is None:
         cols[1].warning("Ground Truth not found (missing key: label)")
@@ -944,7 +998,7 @@ with tab_compare:
         )
 
     # ========================================================
-    # 3️⃣–5️⃣ MODEL PREDICTIONS
+    # 3–5 MODEL PREDICTIONS
     # ========================================================
     for j in range(3):
 
@@ -956,7 +1010,7 @@ with tab_compare:
 
             # inference
             t_model = float(T_BEST[m])
-            _, _, probs_m, _ = infer_with_internals(
+            _, _, probs_m, _, _ = infer_with_internals(
                 m,
                 x13c,
                 t_used=t_model
