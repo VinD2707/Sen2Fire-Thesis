@@ -929,6 +929,17 @@ with tab_compare:
             key="viz_mode_compare",
         )
 
+        # viz_mode = st.radio(
+        #     "Visualization Mode",
+        #     [
+        #         "Visualize by Sigmoid Binary Mask (thr=0.05)",
+        #         "Visualize by Postprocessed Mask (CRF + Thr + CCA)",
+        #         "Visualize by Block (from Sigmoid Binary)",
+        #     ],
+        #     horizontal=True,
+        #     key="viz_mode_compare",
+        # )
+
     # ========================================================
     # MODEL SELECTION
     # ========================================================
@@ -1010,7 +1021,7 @@ with tab_compare:
 
             # inference
             t_model = float(T_BEST[m])
-            _, _, probs_m, _, _ = infer_with_internals(
+            _, _, probs_m, _, mask_final_m = infer_with_internals(
                 m,
                 x13c,
                 t_used=t_model
@@ -1037,18 +1048,22 @@ with tab_compare:
                 pred_vis = blockify_and_threshold_like_nb(
                     probs_m,
                     km,
-                    minpm
+                    minpm,
+                    binarize=True,
+                    bin_thr=t_model  # <--- PENTING: 0.05, bukan 0.5
                 )
                 caption_txt = (
                     f"{DISPLAY_NAME.get(m, m)}\n"
                     f"Prediction (Blockified k={km})"
                 )
             else:
-                pred_vis = (probs_m >= t_model).astype(np.uint8)
+                # ini hasil postprocessing yang sama dengan tab 1 v4 (mask_final)
+                pred_vis = mask_final_m.astype(np.uint8)
                 caption_txt = (
                     f"{DISPLAY_NAME.get(m, m)}\n"
-                    f"Prediction (Sigmoid Binary)"
+                    f"Prediction (CRF + Thr + CCA)"
                 )
+
 
             cols[col_idx].image(
                 reds_cmap_img(pred_vis),
