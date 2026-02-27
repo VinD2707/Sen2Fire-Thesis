@@ -924,7 +924,7 @@ with tab_compare:
     with header_cols[1]:
         viz_mode = st.radio(
             "Visualization Mode",
-            ["Visualize by Block", "Visualize by Sigmoid Binary Mask"],
+            ["Visualize by Block", "Visualize by Binary Mask"],
             horizontal=True,
             key="viz_mode_compare",
         )
@@ -1075,3 +1075,4 @@ with tab_compare:
             cols[col_idx].info(
                 "Select more models (up to 3) to fill this slot."
             )
+
