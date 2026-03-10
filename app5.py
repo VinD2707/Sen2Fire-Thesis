@@ -107,6 +107,18 @@ def load_norm_stats(path: Path):
 # ============================================================
 APP_DIR = Path(__file__).resolve().parent
 
+# ============================================================
+# SAMPLE PATCHES (for demo users)
+# ============================================================
+SAMPLE_PATCHES = {
+    "scene_3_patch_4_11": APP_DIR / "patches" / "scene_3_patch_4_11.npz",
+    "scene_3_patch_5_12": APP_DIR / "patches" / "scene_3_patch_5_12.npz",
+    "scene_4_patch_10_12": APP_DIR / "patches" / "scene_4_patch_10_12.npz",
+    "scene_4_patch_13_12": APP_DIR / "patches" / "scene_4_patch_13_12.npz",
+}
+
+
+
 WEIGHTS = {
     "U-Net (JP retrained)": APP_DIR / "thesis_unet" / "unet_best_retrained2.pth",
     "U-Net Eff (EfficientNet-B4)": APP_DIR / "unet_eff" / "efficientb4_pretrained.pth",
@@ -717,6 +729,15 @@ with tab_single:
     st.markdown('<div class="upload-card">', unsafe_allow_html=True)
     st.markdown("## Input")
 
+    # ============================================
+    # INPUT SOURCE
+    # ============================================
+    input_mode = st.radio(
+        "Input Source",
+        ["Upload NPZ", "Use Sample Patch"],
+        horizontal=True,
+    )
+
     c1, c2, c3 = st.columns([1, 2.2, 1])
     with c2:
         model_key = st.selectbox(
@@ -728,13 +749,27 @@ with tab_single:
         )
 
     u1, u2, u3 = st.columns([1, 2.2, 1])
+
     with u2:
-        uploaded = st.file_uploader(
-            "Upload test patch (.npz)",
-            type=["npz"],
-            key="single_upload",
-            label_visibility="collapsed"
-        )
+
+        if input_mode == "Upload NPZ":
+
+            uploaded = st.file_uploader(
+                "Upload test patch (.npz)",
+                type=["npz"],
+                key="single_upload",
+                label_visibility="collapsed"
+            )
+
+        else:
+
+            sample_choice = st.selectbox(
+                "Choose sample patch",
+                list(SAMPLE_PATCHES.keys()),
+                format_func=lambda x: x.replace("_", " ")
+            )
+
+            uploaded = None
 
     st.markdown(
         """
@@ -748,15 +783,30 @@ Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>labe
     st.markdown("</div>", unsafe_allow_html=True)  # upload-card
     st.markdown("</div>", unsafe_allow_html=True)  # center-wrap
 
-    if uploaded is None:
-        st.info("Choose a model, then upload a .npz file to start.")
-        st.stop()
+    if input_mode == "Upload NPZ":
 
-    try:
-        x13, gt01 = load_npz_from_bytes(uploaded.getvalue())
-    except Exception as e:
-        st.error(f"Failed to read NPZ: {e}")
-        st.stop()
+        if uploaded is None:
+            st.info("Choose a model, then upload a .npz file to start.")
+            st.stop()
+
+        try:
+            x13, gt01 = load_npz_from_bytes(uploaded.getvalue())
+        except Exception as e:
+            st.error(f"Failed to read NPZ: {e}")
+            st.stop()
+
+    else:
+
+        sample_path = SAMPLE_PATCHES[sample_choice]
+
+        if not sample_path.exists():
+            st.error(f"Sample patch not found: {sample_path}")
+            st.stop()
+
+        with open(sample_path, "rb") as f:
+            x13, gt01 = load_npz_from_bytes(f.read())
+
+        uploaded = type("obj", (), {"name": sample_choice})
 
     H, W = x13.shape[1], x13.shape[2]
     size_ok = (H == 512 and W == 512)
@@ -956,21 +1006,49 @@ with tab_compare:
     # ========================================================
     # FILE UPLOAD
     # ========================================================
-    uploaded2 = st.file_uploader(
-        "Upload test patch (.npz)",
-        type=["npz"],
-        key="compare_upload",
+    compare_mode = st.radio(
+        "Input Source",
+        ["Upload NPZ", "Use Sample Patch"],
+        horizontal=True,
+        key="compare_input_mode"
     )
 
-    if uploaded2 is None:
-        st.info("Upload a .npz file to compare models.")
-        st.stop()
+    if compare_mode == "Upload NPZ":
 
-    try:
-        x13c, gt01c = load_npz_from_bytes(uploaded2.getvalue())
-    except Exception as e:
-        st.error(f"Failed to read NPZ: {e}")
-        st.stop()
+        uploaded2 = st.file_uploader(
+            "Upload test patch (.npz)",
+            type=["npz"],
+            key="compare_upload",
+        )
+
+    else:
+
+        sample_choice2 = st.selectbox(
+            "Choose sample patch",
+            list(SAMPLE_PATCHES.keys()),
+            key="compare_sample"
+        )
+
+        uploaded2 = None
+
+    if compare_mode == "Upload NPZ":
+
+        if uploaded2 is None:
+            st.info("Upload a .npz file to compare models.")
+            st.stop()
+
+        try:
+            x13c, gt01c = load_npz_from_bytes(uploaded2.getvalue())
+        except Exception as e:
+            st.error(f"Failed to read NPZ: {e}")
+            st.stop()
+
+    else:
+
+        sample_path = SAMPLE_PATCHES[sample_choice2]
+
+        with open(sample_path, "rb") as f:
+            x13c, gt01c = load_npz_from_bytes(f.read())
 
     # ========================================================
     # SWIR VISUALIZATION
