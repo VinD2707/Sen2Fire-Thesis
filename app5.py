@@ -700,10 +700,33 @@ hr { border: none; border-top: 1px solid rgba(255,255,255,0.10); margin: 18px 0;
 )
 
 # ============================================================
-# HEADER
+# HEADER (Revisi: Background Ringkas)
 # ============================================================
 st.title("Sen2Fire — Pixel-wise Segmentation")
-st.markdown("Segmentation (logits) → sigmoid → CRF → static threshold (0.05) → CCA (min_pixels=2582)")
+
+# Membuat dua kolom: 
+# Kolom 1 untuk teks (60% lebar), Kolom 2 untuk gambar (40% lebar)
+header_col1, header_col2 = st.columns([1.5, 1])
+
+with header_col1:
+    st.markdown("### Background Ringkas")
+    st.markdown("#### Masalah dan Novelti:")
+    st.markdown("""
+    1. **Multispectral vs RGB:** Mayoritas dataset deteksi kebakaran bersifat khusus RGB. Penelitian ini melibatkan *multispectral bands* seperti **SWIR, NBR, NDVI, dan Aerosol** untuk akurasi yang lebih baik.
+    2. **Fokus Post-Processing:** Pendekatan ditekankan pada peningkatan hasil melalui **Post-Processing** (CRF, CCA, Thresholding), bukan melalui optimasi arsitektur model atau loss functions.
+    """)
+
+with header_col2:
+    # Pastikan file gambar ini ada di folder yang sama atau ganti path-nya
+    # Jika gambar belum ada di folder, Anda bisa menggunakan st.image(uploaded_file)
+    st.image(
+        "Screenshot 2026-03-11 053410.png", 
+        # r"D:\BINUS\Thesis\Bahan Sidang\KoreksiStreamlit\Screenshot 2026-03-11 053410.png",
+        caption="Multispectral Bands Visualization (RGB, SWIR, NBR, NDVI, Aerosol, Label)",
+        use_column_width=True
+    )
+
+st.markdown("---") # Garis pemisah setelah header
 
 # validate paths early
 missing = []
@@ -730,13 +753,22 @@ with tab_single:
     st.markdown("## Input")
 
     # ============================================
-    # INPUT SOURCE
+    # INPUT SOURCE (Dinamis & Swap Position)
     # ============================================
     input_mode = st.radio(
         "Input Source",
-        ["Upload NPZ", "Use Sample Patch"],
+        ["Use Sample Patch", "Upload NPZ"], 
         horizontal=True,
+        index=None, 
+        label_visibility="collapsed"
     )
+
+    if input_mode == "Upload NPZ":
+        st.markdown('<p style="color: #ff4b4b; font-weight: bold;">Berhubung kalian tidak memiliki datasetnya, mohon untuk klik dan gunakan "Use Sample Patch" saja</p>', unsafe_allow_html=True)
+    elif input_mode == "Use Sample Patch":
+        st.markdown('<p style="color: #4b91ff; font-weight: bold;">Silakan pilih model yang akan digunakan dan juga Sample Patch yang akan diuji.</p>', unsafe_allow_html=True)
+    else:
+        st.info("Silakan klik Use Sample Patch untuk dimulai.")
 
     c1, c2, c3 = st.columns([1, 2.2, 1])
     with c2:
@@ -749,228 +781,176 @@ with tab_single:
         )
 
     u1, u2, u3 = st.columns([1, 2.2, 1])
-
+    
     with u2:
-
         if input_mode == "Upload NPZ":
-
             uploaded = st.file_uploader(
                 "Upload test patch (.npz)",
                 type=["npz"],
                 key="single_upload",
                 label_visibility="collapsed"
             )
-
-        else:
-
+        elif input_mode == "Use Sample Patch":
             sample_choice = st.selectbox(
                 "Choose sample patch",
                 list(SAMPLE_PATCHES.keys()),
                 format_func=lambda x: x.replace("_", " ")
             )
-
             uploaded = None
 
     st.markdown(
         """
-<div class="center-muted">
-Accepted: <b>.npz</b> • Recommended patch size: <b>512×512</b><br/>
-Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>label</code> (for Ground Truth display)
-</div>
-""",
+        <div class="center-muted">
+        Accepted: <b>.npz</b> • Recommended patch size: <b>512×512</b><br/>
+        Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>label</code> (for Ground Truth display)
+        </div>
+        """,
         unsafe_allow_html=True,
     )
-    st.markdown("</div>", unsafe_allow_html=True)  # upload-card
-    st.markdown("</div>", unsafe_allow_html=True)  # center-wrap
+    st.markdown("</div>", unsafe_allow_html=True)  
+    st.markdown("</div>", unsafe_allow_html=True)  
 
-    if input_mode == "Upload NPZ":
+    # ========================================================
+    # LOGIKA PINTU MASUK TAB 1 (Pengganti st.stop)
+    # ========================================================
+    ready_single = False
 
-        if uploaded is None:
-            st.info("Choose a model, then upload a .npz file to start.")
-            st.stop()
-
+    if input_mode == "Upload NPZ" and uploaded is not None:
         try:
             x13, gt01 = load_npz_from_bytes(uploaded.getvalue())
+            ready_single = True
         except Exception as e:
             st.error(f"Failed to read NPZ: {e}")
-            st.stop()
-
-    else:
-
+            
+    elif input_mode == "Use Sample Patch":
         sample_path = SAMPLE_PATCHES[sample_choice]
-
         if not sample_path.exists():
             st.error(f"Sample patch not found: {sample_path}")
-            st.stop()
+        else:
+            with open(sample_path, "rb") as f:
+                x13, gt01 = load_npz_from_bytes(f.read())
+            uploaded = type("obj", (), {"name": sample_choice})
+            ready_single = True
 
-        with open(sample_path, "rb") as f:
-            x13, gt01 = load_npz_from_bytes(f.read())
+    # Jika data sudah siap, baru jalankan proses di bawah ini
+    if ready_single:
+        H, W = x13.shape[1], x13.shape[2]
+        size_ok = (H == 512 and W == 512)
+        t_used = float(T_BEST[model_key])
+        
+        visuals, internals, probs_raw, probs_crf, mask_np = infer_with_internals(model_key, x13, t_used=t_used)
 
-        uploaded = type("obj", (), {"name": sample_choice})
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("## Model Info")
+        st.markdown(f"""
+        **Model Name:** {DISPLAY_NAME.get(model_key, model_key)}
 
-    H, W = x13.shape[1], x13.shape[2]
-    size_ok = (H == 512 and W == 512)
+        **Threshold used (t_used):** {t_used}
 
-    t_used = float(T_BEST[model_key])
-    # visuals, internals, probs_np, mask_np = infer_with_internals(model_key, x13, t_used=t_used)
-    visuals, internals, probs_raw, probs_np, mask_np = infer_with_internals(model_key, x13, t_used=t_used)
+        **Patch Size:** {H} × {W}{" ✅" if size_ok else " ⚠️"}
 
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("## Model Info")
-    st.markdown(f"""
-**Model Name:**  
-{DISPLAY_NAME.get(model_key, model_key)}
+        **Input:** Model input: concatenation → **(13, H, W)** (12-band image + 1 aerosol)
 
-**Threshold used (t_used):**  
-{t_used}
+        **Output:** Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary mask
+        """)
 
-**Patch Size:**  
-{H} × {W}{" ✅" if size_ok else " ⚠️"}
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        if gt01 is not None:
+            st.markdown("## Selected Patch Prediction Overview")
+            st.markdown('<div class="small">metrics: loss, precision, recall, f1, accuracy, PR_AUC</div>', unsafe_allow_html=True)
 
-**Input:**  
-Model input: concatenation → **(13, H, W)** (12-band image + 1 aerosol)
+            pm = compute_patch_metrics(gt01, probs_raw, mask_np)
+            
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Loss (BCE)", f"{pm['loss']:.4f}")
+            c2.metric("Precision", f"{pm['precision']:.4f}")
+            c3.metric("Recall", f"{pm['recall']:.4f}")
+            c4.metric("F1-score", f"{pm['f1']:.4f}")
+            c5.metric("Accuracy", f"{pm['acc']:.4f}")
+            c6.metric("PR_AUC", "N/A" if pm["pr_auc"] is None else f"{pm['pr_auc']:.4f}")
 
-**Output:**  
-Logits → sigmoid probabilities (0–1) → threshold (**t_used**) → binary mask
-""")
+            with st.expander("📊 Confusion Matrix Visualization", expanded=True):
+                st.markdown("""
+                    <style>
+                    .cm-box { border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 20px; text-align: center; background: rgba(255,255,255,0.05); }
+                    .cm-label { font-size: 0.8rem; color: #888; text-transform: uppercase; margin-bottom: 5px; }
+                    .cm-value { font-size: 1.8rem; font-weight: bold; color: #ff4b4b; } 
+                    .cm-tp, .cm-tn { color: #4b91ff; } 
+                    </style>
+                """, unsafe_allow_html=True)
 
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    if gt01 is not None:
-        st.markdown("## Selected Patch Prediction Overview")
-        st.markdown('<div class="small">metrics: loss, precision, recall, f1, accuracy, PR_AUC</div>', unsafe_allow_html=True)
+                r1c1, r1c2 = st.columns(2)
+                with r1c1:
+                    st.markdown(f'<div class="cm-box"><div class="cm-label">True Positive (TP)</div><div class="cm-value cm-tp">{pm["tp"]:,}</div></div>', unsafe_allow_html=True)
+                with r1c2:
+                    st.markdown(f'<div class="cm-box"><div class="cm-label">False Positive (FP)</div><div class="cm-value">{pm["fp"]:,}</div></div>', unsafe_allow_html=True)
+                
+                st.write("") 
+                r2c1, r2c2 = st.columns(2)
+                with r2c1:
+                    st.markdown(f'<div class="cm-box"><div class="cm-label">False Negative (FN)</div><div class="cm-value">{pm["fn"]:,}</div></div>', unsafe_allow_html=True)
+                with r2c2:
+                    st.markdown(f'<div class="cm-box"><div class="cm-label">True Negative (TN)</div><div class="cm-value cm-tn">{pm["tn"]:,}</div></div>', unsafe_allow_html=True)
+                
+                st.caption("Informasi: Angka di atas menunjukkan jumlah total pixel untuk setiap kategori evaluasi pada patch ini.")
+        else:
+            st.info("No Ground Truth `label` found → patch metrics not computed.")
 
-        pm = compute_patch_metrics(gt01, probs_raw, mask_np)
-        # pm = compute_patch_metrics(gt01, probs_np, mask_np)
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Loss (BCE)", f"{pm['loss']:.4f}")
-        c2.metric("Precision", f"{pm['precision']:.4f}")
-        c3.metric("Recall", f"{pm['recall']:.4f}")
-        c4.metric("F1-score", f"{pm['f1']:.4f}")
-        c5.metric("Accuracy", f"{pm['acc']:.4f}")
-        c6.metric("PR_AUC", "N/A" if pm["pr_auc"] is None else f"{pm['pr_auc']:.4f}")
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("## Visualization")
+        st.caption("**Note:** Red area represents fire pixels, while white area represents non-fire pixels in both the Ground Truth and the Binary Fire Map.")
 
-        with st.expander("Confusion details (TP/FP/FN/TN)"):
-            st.json({k: pm[k] for k in ["tp", "fp", "fn", "tn"]})
-    else:
-        st.info("No Ground Truth `label` found → patch metrics not computed.")
+        cfg = VIS_BLOK_CFG.get(model_key, {"t_best": 0.05, "min_pixel": 448.0, "blok_pixel": 56, "swir_idx": 10})
+        t_vis = float(cfg["t_best"])
+        min_pixel = float(cfg["min_pixel"])
+        blok_pixel = int(cfg["blok_pixel"])
+        swir_idx = int(cfg["swir_idx"])
 
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    
-    
-    st.markdown("## Visualization")
-    st.caption(
-        "**Note:** Red area represents fire pixels, while white area represents non-fire pixels "
-        "in both the Ground Truth and the Binary Fire Map."
-    )
+        area_val = float((probs_raw >= t_vis).astype(np.float32).mean())
+        patch_name = uploaded.name if hasattr(uploaded, "name") else "patch"
 
-    # --- notebook-style params (vis-blok-all_final.ipynb) ---
-    cfg = VIS_BLOK_CFG.get(model_key, {"t_best": 0.05, "min_pixel": 448.0, "blok_pixel": 56, "swir_idx": 10})
-    t_vis = float(cfg["t_best"])
-    min_pixel = float(cfg["min_pixel"])
-    blok_pixel = int(cfg["blok_pixel"])
-    swir_idx = int(cfg["swir_idx"])
+        v1, v2, v3, v4, v5 = st.columns(5, gap="medium")
 
-    # area seperti notebook: mask = (probs >= t_best) lalu mean()
-    # area_val = float((probs_np >= t_vis).astype(np.float32).mean())
-    area_val = float((probs_raw >= t_vis).astype(np.float32).mean())
-    patch_name = uploaded.name if hasattr(uploaded, "name") else "patch"
+        swir_vis = swir_minmax_for_display(x13, swir_idx=swir_idx)
+        v1.image((swir_vis * 255).astype(np.uint8), caption=f"{patch_name}\nSWIR | Area={area_val:.4f}", use_column_width=True)
 
-    v1, v2, v3, v4, v5 = st.columns(5, gap="medium")
+        if gt01 is None:
+           v2.warning("Ground Truth not found") 
+        else:
+            v2.image(reds_cmap_img(gt01), caption="Ground Truth", use_column_width=True)
 
-    # SWIR
-    swir_vis = swir_minmax_for_display(x13, swir_idx=swir_idx)
-    v1.image(
-       (swir_vis * 255).astype(np.uint8),
-       caption=f"{patch_name}\nSWIR | Area={area_val:.4f}",
-       use_column_width=True
-    )
+        v3.image(reds_cmap_img(probs_raw), caption="Sigmoid Prediction (Raw Probability)", use_column_width=True)
+        v4.image(reds_cmap_img(mask_np), caption="Final Binary (CRF + Static Thr + CCA)", use_column_width=True)
 
-    # Ground Truth
-    if gt01 is None:
-       v2.warning("Ground Truth not found") 
-    else:
-        v2.image(
-            reds_cmap_img(gt01),
-            caption="Ground Truth",
-            use_column_width=True
-        )
+        mask_block = blockify_and_threshold_like_nb(probs_raw, blok_pixel, min_pixel, binarize=True, bin_thr=0.05)
+        v5.image(reds_cmap_img(mask_block), caption=f"Blockified (k={blok_pixel})", use_column_width=True)
 
-    # Sigmoid Prediction (RAW)
-    v3.image(
-        reds_cmap_img(probs_raw),
-        caption="Sigmoid Prediction (Raw Probability)",
-        use_column_width=True
-    )
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown(f"## {DISPLAY_NAME.get(model_key, model_key)}")
 
-    # Final Binary (CRF + Threshold + CCA)
-    v4.image(
-        reds_cmap_img(mask_np),
-        caption="Final Binary (CRF + Static Thr + CCA)",
-        use_column_width=True
-    )
+        dfm = load_metrics_df(model_key)
+        table = build_train_val_test_table(dfm, model_key)
+        row = best_overall_row(dfm)
+        
+        if row is not None:
+            run_str = str(row.get("run", ""))
+            ep_str = str(int(row.get("epoch", -1))) if "epoch" in row.index else ""
+            st.markdown(f'<div class="small">Train/Val taken from best epoch (best va_f1) → run: <b>{run_str}</b>, epoch: <b>{ep_str}</b>. Test is hard-coded (TEST_METRICS).</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="small">Train/Val table not found in metrics file (or `va_f1` missing). Test is still shown from TEST_METRICS.</div>', unsafe_allow_html=True)
 
-    # Blockified (Area-level)
-    # mask_block = blockify_and_threshold_like_nb(probs_np, blok_pixel, min_pixel)
-    # mask_block = blockify_and_threshold_like_nb(probs_raw, blok_pixel, min_pixel)
-
-    mask_block = blockify_and_threshold_like_nb(
-        probs_raw,
-        # probs_np,
-        blok_pixel,
-        min_pixel,
-        binarize=True,
-        bin_thr=0.05
-    )
-    
-    v5.image(
-        reds_cmap_img(mask_block),
-        caption=f"Blockified (k={blok_pixel})",
-        use_column_width=True
-    )
-
-
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown(f"## {DISPLAY_NAME.get(model_key, model_key)}")
-
-    dfm = load_metrics_df(model_key)
-    table = build_train_val_test_table(dfm, model_key)
-
-    row = best_overall_row(dfm)
-    if row is not None:
-        run_str = str(row.get("run", ""))
-        ep_str = str(int(row.get("epoch", -1))) if "epoch" in row.index else ""
-        st.markdown(
-            f'<div class="small">Train/Val taken from best epoch (best va_f1) → run: <b>{run_str}</b>, epoch: <b>{ep_str}</b>. Test is hard-coded (TEST_METRICS).</div>',
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown(
-            '<div class="small">Train/Val table not found in metrics file (or `va_f1` missing). Test is still shown from TEST_METRICS.</div>',
-            unsafe_allow_html=True
-        )
-
-    st.dataframe(table, use_container_width=True)
-
-    st.markdown(
-        '<div class="small" style="margin-top:10px;">Notes: This app is pixel-wise only. Patch-level aggregation is removed.</div>',
-        unsafe_allow_html=True,
-    )
+        st.dataframe(table, use_container_width=True)
+        st.markdown('<div class="small" style="margin-top:10px;">Notes: This app is pixel-wise only. Patch-level aggregation is removed.</div>', unsafe_allow_html=True)
 
 
 # ============================================================
-# TAB 2 — COMPARISON (visual only)
-# SWIR + GT + 3 aggregated binary predictions (56x56)
+# TAB 2 — COMPARISON (Visual Only)
 # ============================================================
 with tab_compare:
-
-    # ========================================================
-    # HEADER + TOGGLE (KANAN ATAS)
-    # ========================================================
+    
     header_cols = st.columns([3, 2])
-
     with header_cols[0]:
         st.subheader("Model Comparison (Visual Only)")
-
     with header_cols[1]:
         viz_mode = st.radio(
             "Visualization Mode",
@@ -979,22 +959,7 @@ with tab_compare:
             key="viz_mode_compare",
         )
 
-        # viz_mode = st.radio(
-        #     "Visualization Mode",
-        #     [
-        #         "Visualize by Sigmoid Binary Mask (thr=0.05)",
-        #         "Visualize by Postprocessed Mask (CRF + Thr + CCA)",
-        #         "Visualize by Block (from Sigmoid Binary)",
-        #     ],
-        #     horizontal=True,
-        #     key="viz_mode_compare",
-        # )
-
-    # ========================================================
-    # MODEL SELECTION
-    # ========================================================
     all_models = list(WEIGHTS.keys())
-
     models = st.multiselect(
         "Select models to compare (max 3 will be shown)",
         all_models,
@@ -1004,153 +969,81 @@ with tab_compare:
     )
 
     # ========================================================
-    # FILE UPLOAD
+    # FILE UPLOAD TAB 2
     # ========================================================
     compare_mode = st.radio(
         "Input Source",
-        ["Upload NPZ", "Use Sample Patch"],
+        ["Use Sample Patch", "Upload NPZ"], 
         horizontal=True,
+        index=None, 
         key="compare_input_mode"
     )
 
     if compare_mode == "Upload NPZ":
-
-        uploaded2 = st.file_uploader(
-            "Upload test patch (.npz)",
-            type=["npz"],
-            key="compare_upload",
-        )
-
+        st.markdown('<p style="color: #ff4b4b; font-weight: bold;">Berhubung kalian tidak memiliki datasetnya, mohon untuk klik dan gunakan "Use Sample Patch" saja</p>', unsafe_allow_html=True)
+    elif compare_mode == "Use Sample Patch":
+        st.markdown('<p style="color: #4b91ff; font-weight: bold;">Silakan pilih model-model yang akan dibandingkan dan juga Sample Patch yang akan diuji.</p>', unsafe_allow_html=True)
     else:
+        st.info("Silakan klik Use Sample Patch untuk dimulai.")
 
-        sample_choice2 = st.selectbox(
-            "Choose sample patch",
-            list(SAMPLE_PATCHES.keys()),
-            key="compare_sample"
-        )
-
-        uploaded2 = None
+    # ========================================================
+    # LOGIKA PINTU MASUK TAB 2 (Pengganti st.stop)
+    # ========================================================
+    ready_compare = False
 
     if compare_mode == "Upload NPZ":
+        uploaded2 = st.file_uploader("Upload test patch (.npz)", type=["npz"], key="compare_upload", label_visibility="collapsed")
+        if uploaded2 is not None:
+            try:
+                x13c, gt01c = load_npz_from_bytes(uploaded2.getvalue())
+                ready_compare = True
+            except Exception as e:
+                st.error(f"Failed to read NPZ: {e}")
 
-        if uploaded2 is None:
-            st.info("Upload a .npz file to compare models.")
-            st.stop()
-
-        try:
-            x13c, gt01c = load_npz_from_bytes(uploaded2.getvalue())
-        except Exception as e:
-            st.error(f"Failed to read NPZ: {e}")
-            st.stop()
-
-    else:
-
+    elif compare_mode == "Use Sample Patch":
+        sample_choice2 = st.selectbox("Choose sample patch", list(SAMPLE_PATCHES.keys()), key="compare_sample", format_func=lambda x: x.replace("_", " "))
         sample_path = SAMPLE_PATCHES[sample_choice2]
-
         with open(sample_path, "rb") as f:
             x13c, gt01c = load_npz_from_bytes(f.read())
+        ready_compare = True
 
-    # ========================================================
-    # SWIR VISUALIZATION
-    # ========================================================
-    swir = swir_minmax_for_display(x13c, swir_idx=10)
+    # Jika data sudah siap, baru render visualisasi komparasi
+    if ready_compare:
+        swir = swir_minmax_for_display(x13c, swir_idx=10)
+        models_ordered = [m for m in all_models if m in models]
+        models_show = models_ordered[:3]
 
-    models_ordered = [m for m in all_models if m in models]
-    models_show = models_ordered[:3]
+        st.markdown("### Model Comparison")
+        st.caption("**Note:** Ground Truth, raw sigmoid, and blockified maps use `Reds` colormap")
 
-    st.markdown("### Model Comparison")
-    st.caption(
-        "**Note:** Ground Truth, raw sigmoid, and blockified maps use `Reds` colormap"
-    )
+        cols = st.columns(5, gap="medium")
 
-    cols = st.columns(5, gap="medium")
+        cols[0].image((swir * 255).astype(np.uint8), caption="SWIR", use_column_width=True)
 
-    # ========================================================
-    # 1 SWIR
-    # ========================================================
-    cols[0].image(
-        (swir * 255).astype(np.uint8),
-        caption="SWIR",
-        use_column_width=True
-    )
-
-    # ========================================================
-    # 2 GROUND TRUTH
-    # ========================================================
-    if gt01c is None:
-        cols[1].warning("Ground Truth not found (missing key: label)")
-    else:
-        cols[1].image(
-            reds_cmap_img(gt01c),
-            caption="Ground Truth",
-            use_column_width=True
-        )
-
-    # ========================================================
-    # 3–5 MODEL PREDICTIONS
-    # ========================================================
-    for j in range(3):
-
-        col_idx = 2 + j
-
-        if j < len(models_show):
-
-            m = models_show[j]
-
-            # inference
-            t_model = float(T_BEST[m])
-            _, _, probs_m, _, mask_final_m = infer_with_internals(
-                m,
-                x13c,
-                t_used=t_model
-            )
-
-            # notebook config per model
-            cfgm = VIS_BLOK_CFG.get(
-                m,
-                {
-                    "t_best": 0.05,
-                    "min_pixel": 448.0,
-                    "blok_pixel": 56,
-                    "swir_idx": 10
-                }
-            )
-
-            km = int(cfgm["blok_pixel"])
-            minpm = float(cfgm["min_pixel"])
-
-            # =================================================
-            # VISUALIZATION MODE SWITCH
-            # =================================================
-            if viz_mode == "Visualize by Block":
-                pred_vis = blockify_and_threshold_like_nb(
-                    probs_m,
-                    km,
-                    minpm,
-                    binarize=True,
-                    bin_thr=t_model  # <--- PENTING: 0.05, bukan 0.5
-                )
-                caption_txt = (
-                    f"{DISPLAY_NAME.get(m, m)}\n"
-                    f"Prediction (Blockified k={km})"
-                )
-            else:
-                # ini hasil postprocessing yang sama dengan tab 1 v4 (mask_final)
-                pred_vis = mask_final_m.astype(np.uint8)
-                caption_txt = (
-                    f"{DISPLAY_NAME.get(m, m)}\n"
-                    f"Prediction (CRF + Thr + CCA)"
-                )
-
-
-            cols[col_idx].image(
-                reds_cmap_img(pred_vis),
-                caption=caption_txt,
-                use_column_width=True
-            )
-
+        if gt01c is None:
+            cols[1].warning("Ground Truth not found (missing key: label)")
         else:
-            cols[col_idx].info(
-                "Select more models (up to 3) to fill this slot."
-            )
+            cols[1].image(reds_cmap_img(gt01c), caption="Ground Truth", use_column_width=True)
 
+        for j in range(3):
+            col_idx = 2 + j
+            if j < len(models_show):
+                m = models_show[j]
+                t_model = float(T_BEST[m])
+                
+                # inference
+                _, _, probs_m, _, mask_final_m = infer_with_internals(m, x13c, t_used=t_model)
+                cfgm = VIS_BLOK_CFG.get(m, {"t_best": 0.05, "min_pixel": 448.0, "blok_pixel": 56, "swir_idx": 10})
+                km = int(cfgm["blok_pixel"])
+                minpm = float(cfgm["min_pixel"])
+
+                if viz_mode == "Visualize by Block":
+                    pred_vis = blockify_and_threshold_like_nb(probs_m, km, minpm, binarize=True, bin_thr=t_model)
+                    caption_txt = f"{DISPLAY_NAME.get(m, m)}\nPrediction (Blockified k={km})"
+                else:
+                    pred_vis = mask_final_m.astype(np.uint8)
+                    caption_txt = f"{DISPLAY_NAME.get(m, m)}\nPrediction (CRF + Thr + CCA)"
+
+                cols[col_idx].image(reds_cmap_img(pred_vis), caption=caption_txt, use_column_width=True)
+            else:
+                cols[col_idx].info("Select more models (up to 3) to fill this slot.")
