@@ -798,15 +798,15 @@ with tab_single:
             )
             uploaded = None
 
-    st.markdown(
-        """
-        <div class="center-muted">
-        Accepted: <b>.npz</b> • Recommended patch size: <b>512×512</b><br/>
-        Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>label</code> (for Ground Truth display)
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # st.markdown(
+    #     """
+    #     <div class="center-muted">
+    #     Accepted: <b>.npz</b> • Recommended patch size: <b>512×512</b><br/>
+    #     Required keys: <code>image</code>, <code>aerosol</code> • Optional: <code>label</code> (for Ground Truth display)
+    #     </div>
+    #     """,
+    #     unsafe_allow_html=True,
+    # )
     st.markdown("</div>", unsafe_allow_html=True)  
     st.markdown("</div>", unsafe_allow_html=True)  
 
@@ -898,7 +898,16 @@ with tab_single:
 
         st.markdown("<hr/>", unsafe_allow_html=True)
         st.markdown("## Visualization")
-        st.caption("**Note:** Red area represents fire pixels, while white area represents non-fire pixels in both the Ground Truth and the Binary Fire Map.")
+    
+        st.info("""
+        **Visual Interpretation Guide:**
+        * **RGB (Natural Color):** Menggunakan kombinasi **Band 4 (Red), Band 3 (Green), dan Band 2 (Blue)** untuk menampilkan penampakan asli permukaan bumi.
+        * **SWIR (False Color):** Menggunakan kombinasi **Band 12 (SWIR), Band 8 (NIR), dan Band 4 (Red)**. SWIR sangat sensitif terhadap anomali panas tinggi, sehingga area api aktif terlihat sangat kontras.
+        * **NBR (Normalized Burn Ratio):** Dihitung dari **(NIR - SWIR) / (NIR + SWIR)**. Skema warna *copper* digunakan untuk membedakan vegetasi sehat (terang/tembaga) dengan area bekas terbakar (gelap/hitam).
+        * **NDVI (Normalized Difference Vegetation Index):** Dihitung dari **(NIR - Red) / (NIR + Red)**. Skema warna *Red-Green* membedakan vegetasi padat (hijau) dengan area non-vegetasi atau rusak akibat api (merah).
+        * **Aerosol:** Menggunakan data **Sentinel-5P** untuk mendeteksi partikel asap di atmosfer akibat kebakaran hutan.
+        * **Ground Truth & Predictions:** **Area Merah** merepresentasikan pixel api (*fire*), sedangkan **Area Putih** merepresentasikan pixel non-api (*non-fire*).
+        """)
 
         cfg = VIS_BLOK_CFG.get(model_key, {"t_best": 0.05, "min_pixel": 448.0, "blok_pixel": 56, "swir_idx": 10})
         t_vis = float(cfg["t_best"])
@@ -911,14 +920,95 @@ with tab_single:
 
         v1, v2, v3, v4, v5 = st.columns(5, gap="medium")
 
-        swir_vis = swir_minmax_for_display(x13, swir_idx=swir_idx)
-        v1.image((swir_vis * 255).astype(np.uint8), caption=f"{patch_name}\nSWIR | Area={area_val:.4f}", use_column_width=True)
+        # ========================================================
+        # MULTISPECTRAL VISUALIZATION HELPER (Adaptasi dari Jupyter Notebook)
+        # ========================================================
+        def get_multispectral_vis(x_13, mode):
+            def normalize_band(band, q_min=2, q_max=98):
+                """
+                Normalizes a band to 0-1 range using percentile clipping 
+                to handle high dynamic range of satellite data.
+                """
+                vmin = np.nanpercentile(band, q_min)
+                vmax = np.nanpercentile(band, q_max)
+                normalized = np.clip(band, vmin, vmax)
+                
+                if vmax != vmin:
+                    normalized = (normalized - vmin) / (vmax - vmin)
+                else:
+                    normalized = normalized - vmin
+                return normalized
 
+            if mode == "RGB (True Color)":
+                # Red=B4(3), Green=B3(2), Blue=B2(1)
+                img = np.stack((
+                    normalize_band(x_13[3]), 
+                    normalize_band(x_13[2]), 
+                    normalize_band(x_13[1])
+                ), axis=-1)
+                return (img * 255).astype(np.uint8)
+            
+            elif mode == "SWIR (False Color)":
+                # SWIR=B12(11)->Red, NIR=B8(7)->Green, Red=B4(3)->Blue
+                img = np.stack((
+                    normalize_band(x_13[11]), 
+                    normalize_band(x_13[7]), 
+                    normalize_band(x_13[3])
+                ), axis=-1)
+                return (img * 255).astype(np.uint8)
+                
+            elif mode == "NBR":
+                # NBR = (NIR - SWIR) / (NIR + SWIR)
+                nir, swir = x_13[7].astype(np.float32), x_13[11].astype(np.float32)
+                nbr = (nir - swir) / (nir + swir + 1e-6)
+                nbr_disp = normalize_band(nbr)
+                return (cm.get_cmap("copper")(nbr_disp)[..., :3] * 255).astype(np.uint8)
+                
+            elif mode == "NDVI":
+                # NDVI = (NIR - Red) / (NIR + Red)
+                nir, red = x_13[7].astype(np.float32), x_13[3].astype(np.float32)
+                ndvi = (nir - red) / (nir + red + 1e-6)
+                ndvi_disp = normalize_band(ndvi)
+                return (cm.get_cmap("RdYlGn")(ndvi_disp)[..., :3] * 255).astype(np.uint8)
+                
+            elif mode == "Aerosol":
+                # Aerosol (Index 12)
+                aer = x_13[12].astype(np.float32)
+                aer_disp = normalize_band(aer)
+                return (cm.get_cmap("Purples")(aer_disp)[..., :3] * 255).astype(np.uint8)
+
+        # ========================================================
+        # 1. INPUT IMAGE (DINAMIS)
+        # ========================================================
+        with v1:
+            # Dropdown untuk memilih mode visualisasi
+            vis_mode = st.selectbox(
+                "Input View",
+                ["RGB (True Color)", "SWIR (False Color)", "NBR", "NDVI", "Aerosol"],
+                label_visibility="collapsed"
+            )
+
+            
+            
+            img_disp = get_multispectral_vis(x13, vis_mode)
+            
+            st.image(
+                img_disp,
+                caption=f"{patch_name}\n{vis_mode}",
+                use_column_width=True
+            )
+
+        # ========================================================
+        # 2. GROUND TRUTH
+        # ========================================================
         if gt01 is None:
            v2.warning("Ground Truth not found") 
         else:
             v2.image(reds_cmap_img(gt01), caption="Ground Truth", use_column_width=True)
 
+        # ========================================================
+        # 3. PREDICTIONS (v3, v4, v5 tidak diubah)
+        # ========================================================
         v3.image(reds_cmap_img(probs_raw), caption="Sigmoid Prediction (Raw Probability)", use_column_width=True)
         v4.image(reds_cmap_img(mask_np), caption="Final Binary (CRF + Static Thr + CCA)", use_column_width=True)
 
